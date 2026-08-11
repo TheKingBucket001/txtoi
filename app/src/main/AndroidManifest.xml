@@ -12,7 +12,8 @@
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/full_backup_content"
-        android:icon="@drawable/ic_module"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="文本菜单控制"
         android:description="@string/app_description"
         android:theme="@style/AppTheme">

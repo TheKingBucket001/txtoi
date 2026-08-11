@@ -26,8 +26,19 @@ android {
         applicationId = "io.github.selectionmenucontrol"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.3.2"
+        versionCode = 6
+        versionName = "0.3.3"
+    }
+
+    signingConfigs {
+        create("release") {
+            if (releaseSigningReady) {
+                storeFile = rootProject.file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
@@ -35,17 +46,6 @@ android {
             isMinifyEnabled = false
             if (releaseSigningReady) {
                 signingConfig = signingConfigs.getByName("release")
-            }
-        }
-    }
-
-    signingConfigs {
-        create("release") {
-            if (releaseSigningReady) {
-                storeFile = file(releaseStoreFile!!)
-                storePassword = releaseStorePassword
-                keyAlias = releaseKeyAlias
-                keyPassword = releaseKeyPassword
             }
         }
     }

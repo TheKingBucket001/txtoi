@@ -2,6 +2,10 @@ name: Android CI
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
   pull_request:
 
 jobs:
@@ -18,5 +22,34 @@ jobs:
         run: sdkmanager 'platforms;android-37.0'
       - name: Make Gradle wrapper executable
         run: chmod +x ./gradlew
+      - name: Restore release signing configuration
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          mkdir -p .local
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > .local/txtoi-release.keystore
+          cat > signing.properties <<EOF
+          storeFile=.local/txtoi-release.keystore
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
       - name: Build and lint
-        run: ./gradlew :app:assembleDebug :app:lintDebug :app:verifyModernXposedMetadata --no-daemon
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ./gradlew :app:assembleRelease :app:lintRelease :app:verifyModernXposedMetadata --no-daemon
+          else
+            ./gradlew :app:assembleDebug :app:lintDebug :app:verifyModernXposedMetadata --no-daemon
+          fi
+      - name: Upload release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: txtoi-release-${{ github.ref_name }}
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error

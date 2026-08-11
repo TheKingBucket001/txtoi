@@ -34,7 +34,7 @@ final class SystemRuleStore {
             .authority(RULES_AUTHORITY)
             .appendPath(RULES_PATH)
             .build();
-    private static final String FORMAT_PREFIX = "v1:";
+    private static final String FORMAT_PREFIX = "v2:";
 
     private SystemRuleStore() {
     }
@@ -104,53 +104,60 @@ final class SystemRuleStore {
         }
     }
 
-    static boolean save(Context context, boolean enabled, Set<String> hiddenComponents) {
+    static boolean save(Context context, Set<String> hiddenComponents) {
         return context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
                 .edit()
-                .putString(SETTING_KEY, encode(enabled, hiddenComponents))
+                .putString(SETTING_KEY, encode(hiddenComponents))
                 .commit();
     }
 
     static Snapshot decode(String value) {
-        if (value == null || !value.startsWith(FORMAT_PREFIX)) {
+        if (value == null) {
             return Snapshot.empty();
         }
         try {
-            String[] parts = value.split(":", 3);
-            if (parts.length != 3 || (!"0".equals(parts[1]) && !"1".equals(parts[1]))) {
+            String encoded;
+            if (value.startsWith(FORMAT_PREFIX)) {
+                encoded = value.substring(FORMAT_PREFIX.length());
+            } else if (value.startsWith("v1:")) {
+                // Read the previous format once so removing the switch does not erase user rules.
+                String[] parts = value.split(":", 3);
+                if (parts.length != 3) {
+                    return Snapshot.empty();
+                }
+                encoded = parts[2];
+            } else {
                 return Snapshot.empty();
             }
-            String decoded = new String(Base64.decode(parts[2], Base64.NO_WRAP), StandardCharsets.UTF_8);
+            String decoded = new String(Base64.decode(encoded, Base64.NO_WRAP), StandardCharsets.UTF_8);
             Set<String> hidden = new HashSet<>();
             if (!decoded.isEmpty()) {
                 Collections.addAll(hidden, decoded.split("\\n"));
                 hidden.remove("");
             }
-            return new Snapshot("1".equals(parts[1]), hidden);
+            return new Snapshot(hidden);
         } catch (IllegalArgumentException ignored) {
             return Snapshot.empty();
         }
     }
 
-    static String encode(boolean enabled, Set<String> hiddenComponents) {
+    static String encode(Set<String> hiddenComponents) {
         ArrayList<String> orderedComponents = new ArrayList<>(hiddenComponents);
         Collections.sort(orderedComponents);
         String payload = String.join("\n", orderedComponents);
         String encoded = Base64.encodeToString(payload.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
-        return FORMAT_PREFIX + (enabled ? "1" : "0") + ":" + encoded;
+        return FORMAT_PREFIX + encoded;
     }
 
     static final class Snapshot {
-        final boolean enabled;
         final Set<String> hiddenComponents;
 
-        Snapshot(boolean enabled, Set<String> hiddenComponents) {
-            this.enabled = enabled;
+        Snapshot(Set<String> hiddenComponents) {
             this.hiddenComponents = Collections.unmodifiableSet(new HashSet<>(hiddenComponents));
         }
 
         static Snapshot empty() {
-            return new Snapshot(true, Collections.emptySet());
+            return new Snapshot(Collections.emptySet());
         }
     }
 
