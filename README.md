@@ -31,7 +31,13 @@
 
 ## 兼容性
 
-当前 Hook 签名针对 ColorOS 16 / Android 16 的 `services.jar` 实测。系统升级后若该签名变化，模块不会执行模糊匹配，菜单将保持系统默认行为。
+Android 是本模块的目标平台，ColorOS 只是目前唯一完成实机验证的定制系统。当前版本严格匹配 `system_server` 中的 `ComputerEngine.queryIntentActivitiesInternal` 9 参数方法，并要求 Modern LibXposed/LSPosed 提供静态 `system` 作用域。
+
+- **已验证**：ColorOS 16 / Android 16（API 36，PLQ110）。
+- **可能兼容但未承诺**：AOSP 或其他厂商系统，只要对应系统的类名、方法参数和返回类型完全一致，并支持 Modern LibXposed 静态 `system` 作用域。
+- **未验证/可能不兼容**：Android 其他版本、MIUI/HyperOS、One UI、OriginOS 等系统。若 `services.jar` 的方法签名不同，模块会主动跳过 Hook，系统菜单保持默认，不会使用模糊匹配。
+
+因此，不能把当前版本描述为“所有 Android 通用”。要支持其他 Android 版本或定制系统，需要为各自的 `system_server` 实现增加独立、经过实机验证的 Hook 适配器。
 
 ## 许可证
 

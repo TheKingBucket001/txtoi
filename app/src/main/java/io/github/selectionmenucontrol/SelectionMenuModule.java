@@ -69,7 +69,7 @@ public final class SelectionMenuModule extends XposedModule {
         // The provider can be unavailable during direct boot. Refresh the proof once a real query arrives.
         reportLoaded();
         SystemRuleStore.Snapshot rules = readRules();
-        if (!rules.enabled || rules.hiddenComponents.isEmpty()) {
+        if (rules.hiddenComponents.isEmpty()) {
             return result;
         }
         try {
