@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.compose.setContent
@@ -21,6 +22,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
@@ -36,6 +39,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
@@ -75,6 +80,7 @@ private data class Processor(val component: String, val label: String)
 private fun ModuleApp(activity: MainActivity) {
     var gateState by remember { mutableStateOf(GateState()) }
     var refreshSignal by remember { mutableIntStateOf(0) }
+    var showAbout by remember { mutableStateOf(false) }
 
     LaunchedEffect(refreshSignal) {
         Thread {
@@ -97,8 +103,10 @@ private fun ModuleApp(activity: MainActivity) {
 
     if (gateState.checking || !gateState.systemHookReady || !gateState.rootReady) {
         EnvironmentGate(gateState) { refreshSignal++ }
+    } else if (showAbout) {
+        AboutScreen(activity) { showAbout = false }
     } else {
-        RuleScreen(activity)
+        RuleScreen(activity) { showAbout = true }
     }
 }
 
@@ -126,7 +134,9 @@ private fun EnvironmentGate(state: GateState, onRefresh: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(MiuixTheme.colorScheme.background)
-            .padding(horizontal = 20.dp),
+            .padding(horizontal = 20.dp)
+            .statusBarsPadding()
+            .navigationBarsPadding(),
         contentAlignment = Alignment.Center,
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -169,10 +179,14 @@ private fun GateRow(title: String, passed: Boolean, summary: String) {
 }
 
 @Composable
-private fun RuleScreen(activity: MainActivity) {
+private fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     var snapshot by remember { mutableStateOf(SystemRuleStore.read(activity)) }
-    var processors by remember { mutableStateOf(loadProcessors(activity)) }
+    var processors by remember { mutableStateOf<List<Processor>?>(null) }
     var saving by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        processors = withContext(Dispatchers.IO) { loadProcessors(activity) }
+    }
 
     fun save(nextEnabled: Boolean, nextHidden: Set<String>) {
         saving = true
@@ -192,14 +206,24 @@ private fun RuleScreen(activity: MainActivity) {
     }
 
     LazyColumn(
-        modifier = Modifier.fillMaxSize().background(MiuixTheme.colorScheme.background),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MiuixTheme.colorScheme.background)
+            .statusBarsPadding()
+            .navigationBarsPadding(),
         contentPadding = PaddingValues(bottom = 32.dp),
     ) {
         item {
-            Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp)) {
-                Text("文本选择菜单", style = MiuixTheme.textStyles.title1, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(6.dp))
-                Text("仅作用于系统框架中的 PROCESS_TEXT 查询", style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onBackgroundVariant)
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp, top = 14.dp, bottom = 18.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("文本选择菜单", style = MiuixTheme.textStyles.title1, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Text("全系统管理 PROCESS_TEXT 扩展项", style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onBackgroundVariant)
+                }
+                TextButton(text = "关于", onClick = onAbout, enabled = !saving)
             }
         }
         item {
@@ -224,12 +248,14 @@ private fun RuleScreen(activity: MainActivity) {
         }
         item {
             Card(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                if (processors.isEmpty()) {
+                if (processors == null) {
+                    Text("正在读取系统扩展项…", modifier = Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2)
+                } else if (processors!!.isEmpty()) {
                     Text("当前没有可配置的文字处理扩展项", modifier = Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2)
                 }
             }
         }
-        items(processors, key = { it.component }) { processor ->
+        items(processors ?: emptyList(), key = { it.component }) { processor ->
             Card(modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp)) {
                 CheckboxPreference(
                     title = processor.label,
@@ -251,6 +277,56 @@ private fun RuleScreen(activity: MainActivity) {
                 onClick = { save(snapshot.enabled, emptySet()) },
                 enabled = snapshot.hiddenComponents.isNotEmpty() && !saving,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 18.dp),
+            )
+        }
+    }
+}
+
+@Composable
+@Suppress("UseKtx")
+private fun AboutScreen(activity: MainActivity, onBack: () -> Unit) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MiuixTheme.colorScheme.background)
+            .statusBarsPadding()
+            .navigationBarsPadding(),
+        contentPadding = PaddingValues(bottom = 32.dp),
+    ) {
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 16.dp, top = 8.dp, bottom = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(text = "返回", onClick = onBack)
+                Text("关于", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 8.dp))
+            }
+        }
+        item {
+            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Column(modifier = Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("文本选择菜单控制", style = MiuixTheme.textStyles.title1, fontWeight = FontWeight.Bold)
+                    Text("版本 0.3.2", style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onBackgroundVariant)
+                    Text("全局管理系统文本选择菜单中的 PROCESS_TEXT 扩展项。", style = MiuixTheme.textStyles.body1)
+                }
+            }
+        }
+        item { SmallTitle("项目") }
+        item {
+            Card(modifier = Modifier.padding(horizontal = 16.dp)) {
+                TextButton(
+                    text = "在 GitHub 查看源码",
+                    onClick = { activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/TheKingBucket001/txtoi"))) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+        item {
+            Text(
+                "本项目采用 GNU GPL v3.0 开源许可证。",
+                modifier = Modifier.padding(horizontal = 28.dp, vertical = 18.dp),
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.onBackgroundVariant,
             )
         }
     }
