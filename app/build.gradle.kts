@@ -26,8 +26,8 @@ android {
         applicationId = "io.github.selectionmenucontrol"
         minSdk = 26
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.3.6"
+        versionCode = 10
+        versionName = "0.3.7"
     }
 
     signingConfigs {

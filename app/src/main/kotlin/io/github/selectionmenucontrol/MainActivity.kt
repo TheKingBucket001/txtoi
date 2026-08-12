@@ -63,6 +63,7 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.preference.CheckboxLocation
 import top.yukonga.miuix.kmp.preference.CheckboxPreference
+import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
@@ -105,16 +106,52 @@ private sealed interface UpdateCheckResult {
     data object Failed : UpdateCheckResult
 }
 
+private object UpdateSettings {
+    private const val PREFERENCES_NAME = "update_settings"
+    private const val AUTO_CHECK_KEY = "auto_check"
+    private const val CACHED_VERSION_KEY = "cached_version"
+    private const val CACHED_URL_KEY = "cached_url"
+    private const val CACHED_AT_KEY = "cached_at"
+
+    fun isAutoCheckEnabled(context: Context): Boolean = preferences(context).getBoolean(AUTO_CHECK_KEY, true)
+
+    fun setAutoCheckEnabled(context: Context, enabled: Boolean) {
+        preferences(context).edit().putBoolean(AUTO_CHECK_KEY, enabled).apply()
+    }
+
+    fun getFreshCachedRelease(context: Context): UpdateInfo? {
+        val preferences = preferences(context)
+        val cachedAt = preferences.getLong(CACHED_AT_KEY, 0L)
+        val age = System.currentTimeMillis() - cachedAt
+        if (cachedAt <= 0L || age !in 0..UPDATE_CACHE_VALIDITY_MS) return null
+        val version = preferences.getString(CACHED_VERSION_KEY, "").orEmpty()
+        val releaseUrl = preferences.getString(CACHED_URL_KEY, "").orEmpty()
+        return UpdateInfo(version, releaseUrl).takeIf { it.version.isNotBlank() && it.releaseUrl.isNotBlank() }
+    }
+
+    fun saveCachedRelease(context: Context, update: UpdateInfo) {
+        preferences(context).edit()
+            .putString(CACHED_VERSION_KEY, update.version)
+            .putString(CACHED_URL_KEY, update.releaseUrl)
+            .putLong(CACHED_AT_KEY, System.currentTimeMillis())
+            .apply()
+    }
+
+    private fun preferences(context: Context) = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+}
+
 @Composable
 private fun ModuleApp(activity: MainActivity) {
     var gateState by remember { mutableStateOf(GateState()) }
     var refreshSignal by remember { mutableIntStateOf(0) }
     var showAbout by remember { mutableStateOf(false) }
     var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+    var autoCheckEnabled by remember { mutableStateOf(UpdateSettings.isAutoCheckEnabled(activity)) }
 
     // This effect belongs to the Activity's root composition, so page navigation and
     // environment refreshes cannot start another check during the same app session.
-    LaunchedEffect(Unit) {
+    LaunchedEffect(autoCheckEnabled) {
+        if (!autoCheckEnabled) return@LaunchedEffect
         when (val result = withContext(Dispatchers.IO) { checkForUpdate(activity) }) {
             is UpdateCheckResult.Available -> availableUpdate = result.update
             UpdateCheckResult.UpToDate -> Toast.makeText(activity, "暂无更新", Toast.LENGTH_SHORT).show()
@@ -152,7 +189,17 @@ private fun ModuleApp(activity: MainActivity) {
             animationSpec = tween(durationMillis = 220),
             label = "page-transition",
         ) { aboutVisible ->
-            if (aboutVisible) AboutScreen(activity) { showAbout = false }
+            if (aboutVisible) {
+                AboutScreen(
+                    activity = activity,
+                    onBack = { showAbout = false },
+                    autoCheckEnabled = autoCheckEnabled,
+                    onAutoCheckChange = { enabled ->
+                        UpdateSettings.setAutoCheckEnabled(activity, enabled)
+                        autoCheckEnabled = enabled
+                    },
+                )
+            }
             else RuleScreen(activity) { showAbout = true }
         }
     }
@@ -200,6 +247,10 @@ private fun UpdateDialog(update: UpdateInfo, onDismiss: () -> Unit, onOpenReleas
 }
 
 private fun checkForUpdate(context: Context): UpdateCheckResult {
+    UpdateSettings.getFreshCachedRelease(context)?.let { cached ->
+        Log.i(UPDATE_LOG_TAG, "Using cached update result")
+        return resultForRelease(cached)
+    }
     if (!waitForValidatedNetwork(context)) {
         Log.w(UPDATE_LOG_TAG, "Update check skipped: no validated network")
         return UpdateCheckResult.Failed
@@ -208,9 +259,10 @@ private fun checkForUpdate(context: Context): UpdateCheckResult {
     var lastFailure: Throwable? = null
     repeat(UPDATE_CHECK_ATTEMPTS) { attempt ->
         try {
-            val result = requestLatestRelease()
+            val release = requestLatestRelease()
+            UpdateSettings.saveCachedRelease(context, release)
             Log.i(UPDATE_LOG_TAG, "Update check succeeded on attempt ${attempt + 1}")
-            return result
+            return resultForRelease(release)
         } catch (error: Throwable) {
             lastFailure = error
             Log.w(UPDATE_LOG_TAG, "Update check attempt ${attempt + 1} failed: ${error.javaClass.simpleName}")
@@ -223,32 +275,35 @@ private fun checkForUpdate(context: Context): UpdateCheckResult {
     return UpdateCheckResult.Failed
 }
 
-private fun requestLatestRelease(): UpdateCheckResult {
+private fun requestLatestRelease(): UpdateInfo {
     var connection: HttpURLConnection? = null
     try {
         connection = (URL(LATEST_RELEASE_URL).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = UPDATE_REQUEST_TIMEOUT_MS
             readTimeout = UPDATE_REQUEST_TIMEOUT_MS
-            setRequestProperty("Accept", "application/vnd.github+json")
             setRequestProperty("User-Agent", "txtoi-android-update-check")
         }
         if (connection.responseCode != HttpURLConnection.HTTP_OK) {
             throw IllegalStateException("Unexpected HTTP status ${connection.responseCode}")
         }
-        val release = connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
-        val version = release.optString("tag_name").trim()
-        val releaseUrl = release.optString("html_url").trim()
-        require(version.isNotBlank() && releaseUrl.isNotBlank()) { "Release response is incomplete" }
-        return if (isVersionNewer(version, BuildConfig.VERSION_NAME)) {
-            UpdateCheckResult.Available(UpdateInfo(version, releaseUrl))
-        } else {
-            UpdateCheckResult.UpToDate
-        }
+        val releaseUrl = connection.url.toString()
+        val releasePath = Uri.parse(releaseUrl).path.orEmpty()
+        require(releasePath.contains("/releases/tag/")) { "Latest release did not redirect to a tag" }
+        val version = Uri.parse(releaseUrl).lastPathSegment.orEmpty().trim()
+        require(version.isNotBlank()) { "Release tag is missing" }
+        return UpdateInfo(version, releaseUrl)
     } finally {
         connection?.disconnect()
     }
 }
+
+private fun resultForRelease(release: UpdateInfo): UpdateCheckResult =
+    if (isVersionNewer(release.version, BuildConfig.VERSION_NAME)) {
+        UpdateCheckResult.Available(release)
+    } else {
+        UpdateCheckResult.UpToDate
+    }
 
 private fun waitForValidatedNetwork(context: Context): Boolean {
     val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
@@ -284,11 +339,12 @@ private fun parseVersion(value: String): List<Int>? {
     return parts.map { it.toIntOrNull() ?: return null }
 }
 
-private const val LATEST_RELEASE_URL = "https://api.github.com/repos/TheKingBucket001/txtoi/releases/latest"
+private const val LATEST_RELEASE_URL = "https://github.com/TheKingBucket001/txtoi/releases/latest"
 private const val NETWORK_READY_TIMEOUT_MS = 12_000L
-private const val UPDATE_REQUEST_TIMEOUT_MS = 8_000
-private const val UPDATE_CHECK_ATTEMPTS = 3
+private const val UPDATE_REQUEST_TIMEOUT_MS = 5_000
+private const val UPDATE_CHECK_ATTEMPTS = 2
 private const val UPDATE_RETRY_DELAY_MS = 1_500L
+private const val UPDATE_CACHE_VALIDITY_MS = 60L * 60L * 1_000L
 private const val UPDATE_LOG_TAG = "SelectionMenuControl"
 
 private fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.HookStatus {
@@ -549,7 +605,12 @@ private fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
 
 @Composable
 @Suppress("UseKtx")
-private fun AboutScreen(activity: MainActivity, onBack: () -> Unit) {
+private fun AboutScreen(
+    activity: MainActivity,
+    onBack: () -> Unit,
+    autoCheckEnabled: Boolean,
+    onAutoCheckChange: (Boolean) -> Unit,
+) {
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -616,6 +677,19 @@ private fun AboutScreen(activity: MainActivity, onBack: () -> Unit) {
                 }
                 AboutInfoDivider()
                 AboutActionRow("开源许可证", "GNU General Public License v3.0", "GPL-3.0", null)
+            }
+        }
+        item {
+            Text("更新", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 14.dp, bottom = 4.dp))
+        }
+        item {
+            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+                SwitchPreference(
+                    checked = autoCheckEnabled,
+                    onCheckedChange = onAutoCheckChange,
+                    title = "自动检测更新",
+                    summary = "打开模块时检测新版本",
+                )
             }
         }
     }
