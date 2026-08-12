@@ -40,6 +40,11 @@ final class SystemRuleStore {
     }
 
     static Snapshot read(Context context) {
+        String globalRules = readGlobalRules(context);
+        if (globalRules != null) {
+            return decode(globalRules);
+        }
+        // Keep the old provider path only for one-time migration from earlier releases.
         long identity = Binder.clearCallingIdentity();
         try (Cursor cursor = context.getContentResolver().query(RULES_URI, null, null, null, null)) {
             if (cursor == null || !cursor.moveToFirst()) {
@@ -105,10 +110,30 @@ final class SystemRuleStore {
     }
 
     static boolean save(Context context, Set<String> hiddenComponents) {
-        return context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+        String encoded = encode(hiddenComponents);
+        if (!RootAccess.putGlobalSetting(SETTING_KEY, encoded)) {
+            return false;
+        }
+        context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
                 .edit()
-                .putString(SETTING_KEY, encode(hiddenComponents))
+                .putString(SETTING_KEY, encoded)
                 .commit();
+        return true;
+    }
+
+    static boolean migrateToGlobal(Context context, Set<String> hiddenComponents) {
+        return RootAccess.putGlobalSetting(SETTING_KEY, encode(hiddenComponents));
+    }
+
+    private static String readGlobalRules(Context context) {
+        long identity = Binder.clearCallingIdentity();
+        try {
+            return Settings.Global.getString(context.getContentResolver(), SETTING_KEY);
+        } catch (Throwable ignored) {
+            return null;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
     }
 
     static Snapshot decode(String value) {

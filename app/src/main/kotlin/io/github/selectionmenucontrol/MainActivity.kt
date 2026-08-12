@@ -1,12 +1,16 @@
 package io.github.selectionmenucontrol
 
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -111,7 +115,7 @@ private fun ModuleApp(activity: MainActivity) {
     // This effect belongs to the Activity's root composition, so page navigation and
     // environment refreshes cannot start another check during the same app session.
     LaunchedEffect(Unit) {
-        when (val result = withContext(Dispatchers.IO) { checkForUpdate() }) {
+        when (val result = withContext(Dispatchers.IO) { checkForUpdate(activity) }) {
             is UpdateCheckResult.Available -> availableUpdate = result.update
             UpdateCheckResult.UpToDate -> Toast.makeText(activity, "暂无更新", Toast.LENGTH_SHORT).show()
             UpdateCheckResult.Failed -> Toast.makeText(activity, "检查更新失败", Toast.LENGTH_SHORT).show()
@@ -195,33 +199,70 @@ private fun UpdateDialog(update: UpdateInfo, onDismiss: () -> Unit, onOpenReleas
     )
 }
 
-private fun checkForUpdate(): UpdateCheckResult {
+private fun checkForUpdate(context: Context): UpdateCheckResult {
+    if (!waitForValidatedNetwork(context)) {
+        Log.w(UPDATE_LOG_TAG, "Update check skipped: no validated network")
+        return UpdateCheckResult.Failed
+    }
+
+    var lastFailure: Throwable? = null
+    repeat(UPDATE_CHECK_ATTEMPTS) { attempt ->
+        try {
+            val result = requestLatestRelease()
+            Log.i(UPDATE_LOG_TAG, "Update check succeeded on attempt ${attempt + 1}")
+            return result
+        } catch (error: Throwable) {
+            lastFailure = error
+            Log.w(UPDATE_LOG_TAG, "Update check attempt ${attempt + 1} failed: ${error.javaClass.simpleName}")
+            if (attempt + 1 < UPDATE_CHECK_ATTEMPTS) {
+                Thread.sleep(UPDATE_RETRY_DELAY_MS)
+            }
+        }
+    }
+    Log.w(UPDATE_LOG_TAG, "Update check failed after $UPDATE_CHECK_ATTEMPTS attempts", lastFailure)
+    return UpdateCheckResult.Failed
+}
+
+private fun requestLatestRelease(): UpdateCheckResult {
     var connection: HttpURLConnection? = null
-    return try {
+    try {
         connection = (URL(LATEST_RELEASE_URL).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 8_000
-            readTimeout = 8_000
+            connectTimeout = UPDATE_REQUEST_TIMEOUT_MS
+            readTimeout = UPDATE_REQUEST_TIMEOUT_MS
             setRequestProperty("Accept", "application/vnd.github+json")
             setRequestProperty("User-Agent", "txtoi-android-update-check")
         }
-        if (connection.responseCode != HttpURLConnection.HTTP_OK) return UpdateCheckResult.Failed
+        if (connection.responseCode != HttpURLConnection.HTTP_OK) {
+            throw IllegalStateException("Unexpected HTTP status ${connection.responseCode}")
+        }
         val release = connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
         val version = release.optString("tag_name").trim()
         val releaseUrl = release.optString("html_url").trim()
-        if (version.isBlank() || releaseUrl.isBlank()) return UpdateCheckResult.Failed
-        if (isVersionNewer(version, BuildConfig.VERSION_NAME)) {
-            UpdateCheckResult.Available(
-                UpdateInfo(version, releaseUrl),
-            )
+        require(version.isNotBlank() && releaseUrl.isNotBlank()) { "Release response is incomplete" }
+        return if (isVersionNewer(version, BuildConfig.VERSION_NAME)) {
+            UpdateCheckResult.Available(UpdateInfo(version, releaseUrl))
         } else {
             UpdateCheckResult.UpToDate
         }
-    } catch (_: Throwable) {
-        UpdateCheckResult.Failed
     } finally {
         connection?.disconnect()
     }
+}
+
+private fun waitForValidatedNetwork(context: Context): Boolean {
+    val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
+    val deadline = System.currentTimeMillis() + NETWORK_READY_TIMEOUT_MS
+    do {
+        val network = connectivity.activeNetwork
+        val capabilities = network?.let(connectivity::getNetworkCapabilities)
+        if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+            && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+            return true
+        }
+        Thread.sleep(500)
+    } while (System.currentTimeMillis() < deadline)
+    return false
 }
 
 private fun isVersionNewer(remote: String, local: String): Boolean {
@@ -244,6 +285,11 @@ private fun parseVersion(value: String): List<Int>? {
 }
 
 private const val LATEST_RELEASE_URL = "https://api.github.com/repos/TheKingBucket001/txtoi/releases/latest"
+private const val NETWORK_READY_TIMEOUT_MS = 12_000L
+private const val UPDATE_REQUEST_TIMEOUT_MS = 8_000
+private const val UPDATE_CHECK_ATTEMPTS = 3
+private const val UPDATE_RETRY_DELAY_MS = 1_500L
+private const val UPDATE_LOG_TAG = "SelectionMenuControl"
 
 private fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.HookStatus {
     val deadline = System.currentTimeMillis() + 2_000L
@@ -367,6 +413,12 @@ private fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     var showRestoreConfirm by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
+        val migrated = withContext(Dispatchers.IO) {
+            SystemRuleStore.migrateToGlobal(activity, snapshot.hiddenComponents)
+        }
+        if (!migrated) {
+            Toast.makeText(activity, "规则迁移失败，请确认 Root 授权", Toast.LENGTH_LONG).show()
+        }
         processors = withContext(Dispatchers.IO) { loadProcessors(activity, snapshot.hiddenComponents) }
     }
 

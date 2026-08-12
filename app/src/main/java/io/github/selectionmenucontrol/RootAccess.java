@@ -31,6 +31,26 @@ final class RootAccess {
         }
     }
 
+    static boolean putGlobalSetting(String key, String value) {
+        if (key == null || !key.matches("[a-z0-9_]+")
+                || value == null || !value.matches("[A-Za-z0-9_:+/=]+")) {
+            return false;
+        }
+        try {
+            Process process = new ProcessBuilder(
+                    "/system/bin/su", "-c", "/system/bin/settings put global " + key + " " + value)
+                    .redirectErrorStream(true)
+                    .start();
+            if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return false;
+            }
+            return process.exitValue() == 0;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     static final class Result {
         final boolean granted;
         final String message;
