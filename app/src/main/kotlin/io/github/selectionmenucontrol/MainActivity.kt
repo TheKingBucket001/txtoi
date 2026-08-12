@@ -266,27 +266,60 @@ private fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.Hook
 
 @Composable
 private fun EnvironmentGate(state: GateState, onRefresh: () -> Unit) {
-    Box(
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .background(MiuixTheme.colorScheme.background)
-            .padding(horizontal = 20.dp)
             .statusBarsPadding()
             .navigationBarsPadding(),
-        contentAlignment = Alignment.Center,
+        contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 28.dp, bottom = 24.dp),
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text("文本选择菜单控制", style = MiuixTheme.textStyles.title1, fontWeight = FontWeight.Bold)
-            Text("运行环境未就绪", style = MiuixTheme.textStyles.subtitle, color = MiuixTheme.colorScheme.onBackgroundVariant)
+        item {
+            Text("文本选择菜单", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+            Text(
+                if (state.checking) "正在检查运行环境" else "运行环境未就绪",
+                modifier = Modifier.padding(top = 6.dp),
+                style = MiuixTheme.textStyles.body1,
+                color = if (state.checking) MiuixTheme.colorScheme.onBackgroundVariant else Color(0xFFD95D39),
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                if (state.checking) "正在确认系统框架与 Root 授权状态。" else "完成以下检查后，即可管理文本选择菜单中的扩展项。",
+                modifier = Modifier.padding(top = 8.dp),
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.onBackgroundVariant,
+            )
+        }
+        item {
+            Text(
+                "运行环境",
+                modifier = Modifier.padding(top = 30.dp, bottom = 8.dp),
+                style = MiuixTheme.textStyles.subtitle,
+                fontWeight = FontWeight.Bold,
+            )
             Card(modifier = Modifier.fillMaxWidth()) {
-                GateRow("系统框架作用域", state.systemHookReady, if (state.systemHookReady) "已在本次启动中加载" else "请确认 LSPosed 中已固定系统框架作用域并重启")
-                GateRow("Root 授权", state.rootReady, state.rootMessage)
+                GateRow(
+                    title = "系统框架作用域",
+                    passed = state.systemHookReady,
+                    summary = if (state.systemHookReady) "已在本次启动中加载" else "请在 LSPosed 中固定系统框架作用域，然后重启设备。",
+                )
+                AboutInfoDivider()
+                GateRow(
+                    title = "Root 授权",
+                    passed = state.rootReady,
+                    summary = state.rootMessage,
+                )
             }
+        }
+        item {
             TextButton(
-                text = if (state.checking) "正在检测" else "重新检测",
+                text = if (state.checking) "正在检查" else "重新检查",
                 onClick = onRefresh,
                 enabled = !state.checking,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 20.dp),
+                colors = ButtonDefaults.textButtonColorsPrimary(),
             )
         }
     }
@@ -297,20 +330,33 @@ private fun GateRow(title: String, passed: Boolean, summary: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .padding(horizontal = 20.dp, vertical = 18.dp),
+        verticalAlignment = Alignment.Top,
     ) {
         Box(
             modifier = Modifier
-                .size(10.dp)
+                .padding(top = 6.dp)
+                .size(9.dp)
                 .clip(androidx.compose.foundation.shape.CircleShape)
                 .background(if (passed) Color(0xFF21A366) else Color(0xFFD95D39)),
         )
-        Column(modifier = Modifier.padding(start = 12.dp).weight(1f)) {
-            Text(title, style = MiuixTheme.textStyles.body1)
-            Text(summary, style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onBackgroundVariant)
+        Column(modifier = Modifier.padding(start = 14.dp).weight(1f)) {
+            Text(title, style = MiuixTheme.textStyles.body1, fontWeight = FontWeight.Bold)
+            Text(
+                summary,
+                modifier = Modifier.padding(top = 4.dp),
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.onBackgroundVariant,
+                lineHeight = 20.sp,
+            )
         }
-        Text(if (passed) "已就绪" else "阻止进入", style = MiuixTheme.textStyles.body2)
+        Text(
+            if (passed) "已就绪" else "未通过",
+            modifier = Modifier.padding(start = 12.dp, top = 1.dp),
+            style = MiuixTheme.textStyles.body2,
+            color = if (passed) Color(0xFF21A366) else Color(0xFFD95D39),
+            fontWeight = FontWeight.Bold,
+        )
     }
 }
 

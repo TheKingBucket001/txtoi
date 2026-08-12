@@ -2,7 +2,7 @@
 
 面向 ColorOS 16 的 Modern LibXposed 模块。它让你在一个列表中选择要隐藏的文字处理扩展项，并让选择结果同时作用于系统和普通应用的文本选择菜单。
 
-> 当前发布版：[`v0.3.4`](https://github.com/TheKingBucket001/txtoi/releases/tag/v0.3.4)
+> 当前发布版：[`v0.3.5`](https://github.com/TheKingBucket001/txtoi/releases/tag/v0.3.5)
 > 已验证设备：ColorOS 16 / Android 16（API 36，PLQ110）
 
 ## 能做什么
