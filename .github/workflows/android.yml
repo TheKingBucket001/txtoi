@@ -1,5 +1,8 @@
 name: Android CI
 
+permissions:
+  contents: write
+
 on:
   push:
     branches:
@@ -53,3 +56,15 @@ jobs:
           name: txtoi-release-${{ github.ref_name }}
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: app/build/outputs/apk/release/app-release.apk
+          body: |
+            ## 改进
+
+            - 新增应用启动时检查 GitHub Release 更新。
+            - 修复关于页面的返回动画与系统返回手势。
+            - 优化构建库 README 的使用、兼容性与构建说明。

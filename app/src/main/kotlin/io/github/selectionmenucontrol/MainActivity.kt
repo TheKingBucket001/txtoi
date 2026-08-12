@@ -8,6 +8,7 @@ import android.content.pm.ResolveInfo
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.ComponentActivity
 import androidx.compose.animation.Crossfade
@@ -50,6 +51,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.animation.core.tween
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.IconButton
@@ -64,6 +66,8 @@ import top.yukonga.miuix.kmp.window.WindowDialog
 import java.util.Collections
 import java.util.Comparator
 import java.util.HashSet
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -86,11 +90,34 @@ private data class GateState(
 
 private data class Processor(val component: String, val label: String, val summary: String)
 
+private data class UpdateInfo(
+    val version: String,
+    val title: String,
+    val releaseUrl: String,
+)
+
+private sealed interface UpdateCheckResult {
+    data class Available(val update: UpdateInfo) : UpdateCheckResult
+    data object UpToDate : UpdateCheckResult
+    data object Failed : UpdateCheckResult
+}
+
 @Composable
 private fun ModuleApp(activity: MainActivity) {
     var gateState by remember { mutableStateOf(GateState()) }
     var refreshSignal by remember { mutableIntStateOf(0) }
     var showAbout by remember { mutableStateOf(false) }
+    var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+
+    // This effect belongs to the Activity's root composition, so page navigation and
+    // environment refreshes cannot start another check during the same app session.
+    LaunchedEffect(Unit) {
+        when (val result = withContext(Dispatchers.IO) { checkForUpdate() }) {
+            is UpdateCheckResult.Available -> availableUpdate = result.update
+            UpdateCheckResult.UpToDate -> Toast.makeText(activity, "暂无更新", Toast.LENGTH_SHORT).show()
+            UpdateCheckResult.Failed -> Toast.makeText(activity, "检查更新失败", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     LaunchedEffect(refreshSignal) {
         Thread {
@@ -114,6 +141,9 @@ private fun ModuleApp(activity: MainActivity) {
     if (gateState.checking || !gateState.systemHookReady || !gateState.rootReady) {
         EnvironmentGate(gateState) { refreshSignal++ }
     } else {
+        BackHandler(enabled = showAbout) {
+            showAbout = false
+        }
         Crossfade(
             targetState = showAbout,
             animationSpec = tween(durationMillis = 220),
@@ -123,7 +153,98 @@ private fun ModuleApp(activity: MainActivity) {
             else RuleScreen(activity) { showAbout = true }
         }
     }
+
+    availableUpdate?.let { update ->
+        UpdateDialog(
+            update = update,
+            onDismiss = { availableUpdate = null },
+            onOpenRelease = {
+                try {
+                    activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(update.releaseUrl)))
+                } catch (_: Throwable) {
+                    Toast.makeText(activity, "无法打开更新页面", Toast.LENGTH_SHORT).show()
+                }
+            },
+        )
+    }
 }
+
+@Composable
+private fun UpdateDialog(update: UpdateInfo, onDismiss: () -> Unit, onOpenRelease: () -> Unit) {
+    WindowDialog(
+        show = true,
+        onDismissRequest = onDismiss,
+        content = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("发现新版本", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "${update.title.ifBlank { "文本菜单控制" }} ${update.version} 已发布。",
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    TextButton(text = "稍后", onClick = onDismiss, modifier = Modifier.weight(1f))
+                    TextButton(
+                        text = "查看更新",
+                        onClick = onOpenRelease,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                    )
+                }
+            }
+        },
+    )
+}
+
+private fun checkForUpdate(): UpdateCheckResult {
+    var connection: HttpURLConnection? = null
+    return try {
+        connection = (URL(LATEST_RELEASE_URL).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 8_000
+            readTimeout = 8_000
+            setRequestProperty("Accept", "application/vnd.github+json")
+            setRequestProperty("User-Agent", "txtoi-android-update-check")
+        }
+        if (connection.responseCode != HttpURLConnection.HTTP_OK) return UpdateCheckResult.Failed
+        val release = connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+        val version = release.optString("tag_name").trim()
+        val releaseUrl = release.optString("html_url").trim()
+        if (version.isBlank() || releaseUrl.isBlank()) return UpdateCheckResult.Failed
+        if (isVersionNewer(version, BuildConfig.VERSION_NAME)) {
+            UpdateCheckResult.Available(
+                UpdateInfo(version, release.optString("name").trim(), releaseUrl),
+            )
+        } else {
+            UpdateCheckResult.UpToDate
+        }
+    } catch (_: Throwable) {
+        UpdateCheckResult.Failed
+    } finally {
+        connection?.disconnect()
+    }
+}
+
+private fun isVersionNewer(remote: String, local: String): Boolean {
+    val remoteParts = parseVersion(remote) ?: return false
+    val localParts = parseVersion(local) ?: return false
+    val count = maxOf(remoteParts.size, localParts.size)
+    for (index in 0 until count) {
+        val remotePart = remoteParts.getOrElse(index) { 0 }
+        val localPart = localParts.getOrElse(index) { 0 }
+        if (remotePart != localPart) return remotePart > localPart
+    }
+    return false
+}
+
+private fun parseVersion(value: String): List<Int>? {
+    val numericVersion = value.trim().removePrefix("v").removePrefix("V").substringBefore('-')
+    val parts = numericVersion.split('.')
+    if (parts.isEmpty() || parts.any { it.isBlank() }) return null
+    return parts.map { it.toIntOrNull() ?: return null }
+}
+
+private const val LATEST_RELEASE_URL = "https://api.github.com/repos/TheKingBucket001/txtoi/releases/latest"
 
 private fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.HookStatus {
     val deadline = System.currentTimeMillis() + 2_000L
