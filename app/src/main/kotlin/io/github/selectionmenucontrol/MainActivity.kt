@@ -92,7 +92,6 @@ private data class Processor(val component: String, val label: String, val summa
 
 private data class UpdateInfo(
     val version: String,
-    val title: String,
     val releaseUrl: String,
 )
 
@@ -178,7 +177,7 @@ private fun UpdateDialog(update: UpdateInfo, onDismiss: () -> Unit, onOpenReleas
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("发现新版本", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Text(
-                    "${update.title.ifBlank { "文本菜单控制" }} ${update.version} 已发布。",
+                    "${update.version} 已发布。",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -213,7 +212,7 @@ private fun checkForUpdate(): UpdateCheckResult {
         if (version.isBlank() || releaseUrl.isBlank()) return UpdateCheckResult.Failed
         if (isVersionNewer(version, BuildConfig.VERSION_NAME)) {
             UpdateCheckResult.Available(
-                UpdateInfo(version, release.optString("name").trim(), releaseUrl),
+                UpdateInfo(version, releaseUrl),
             )
         } else {
             UpdateCheckResult.UpToDate
