@@ -70,3 +70,35 @@ jobs:
 
             - 更新检查改用 Release 页面并增加本地缓存，减少重复请求失败。
             - 关于页面新增自动检测更新开关。
+      - name: Prepare LSPosed mirror release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          metadata=app/build/outputs/apk/release/output-metadata.json
+          version_code=$(jq -er '.elements[0].versionCode' "$metadata")
+          version_name=$(jq -er '.elements[0].versionName' "$metadata")
+          test "$version_code" -gt 0
+          test -n "$version_name"
+          echo "LSPOSED_TAG=$version_code-$version_name" >> "$GITHUB_ENV"
+          echo "LSPOSED_VERSION=$version_name" >> "$GITHUB_ENV"
+          echo "LSPOSED_ASSET=app/build/outputs/apk/release/txtoi-${GITHUB_REF_NAME}.apk" >> "$GITHUB_ENV"
+      - name: Sync release to LSPosed
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.XPOSED_REPO_TOKEN }}
+          MIRROR_REPOSITORY: Xposed-Modules-Repo/io.github.selectionmenucontrol
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?XPOSED_REPO_TOKEN is required for LSPosed release sync}"
+          release_notes="$RUNNER_TEMP/lsposed-release-notes.md"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$release_notes"
+          if gh release view "$LSPOSED_TAG" --repo "$MIRROR_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$LSPOSED_TAG" --repo "$MIRROR_REPOSITORY" --title "$LSPOSED_VERSION" --notes-file "$release_notes"
+            gh release upload "$LSPOSED_TAG" "$LSPOSED_ASSET" --repo "$MIRROR_REPOSITORY" --clobber
+          else
+            gh release create "$LSPOSED_TAG" "$LSPOSED_ASSET" --repo "$MIRROR_REPOSITORY" --title "$LSPOSED_VERSION" --notes-file "$release_notes"
+          fi
+          asset_name=$(basename "$LSPOSED_ASSET")
+          expected_digest="sha256:$(sha256sum "$LSPOSED_ASSET" | awk '{print $1}')"
+          mirror_digest=$(gh release view "$LSPOSED_TAG" --repo "$MIRROR_REPOSITORY" --json assets --jq ".assets[] | select(.name == \"$asset_name\") | .digest")
+          test "$mirror_digest" = "$expected_digest"
