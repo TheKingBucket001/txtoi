@@ -8,7 +8,7 @@
 
 [![Release](https://img.shields.io/github/v/release/TheKingBucket001/txtoi?display_name=tag&label=release&color=brightgreen)](https://github.com/TheKingBucket001/txtoi/releases/latest)
 [![CI](https://github.com/TheKingBucket001/txtoi/actions/workflows/android.yml/badge.svg?branch=main)](https://github.com/TheKingBucket001/txtoi/actions/workflows/android.yml)
-[![License](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](https://github.com/TheKingBucket001/txtoi/blob/main/LICENSE)
 [![ColorOS](https://img.shields.io/badge/ColorOS-16-1677FF.svg)](https://github.com/TheKingBucket001/txtoi)
 
 [下载模块](https://github.com/TheKingBucket001/txtoi/releases/latest) · [源代码](https://github.com/TheKingBucket001/txtoi) · [问题反馈](https://github.com/TheKingBucket001/txtoi/issues)
@@ -59,4 +59,4 @@
 
 ## 许可证
 
-本项目采用 [GNU General Public License v3.0](LICENSE)。
+本项目采用 [GNU General Public License v3.0](https://github.com/TheKingBucket001/txtoi/blob/main/LICENSE)。
