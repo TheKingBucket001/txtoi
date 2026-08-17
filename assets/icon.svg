@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="文本选择菜单控制">
+  <rect x="2" y="2" width="44" height="44" rx="10" fill="#1976D2"/>
+  <path fill="#FFF" d="M13 13h22v4H13zm0 9h15v4H13zm0 9h10v4H13z"/>
+  <path fill="#FF5A52" d="M31 25h5v10h-5z"/>
+</svg>
