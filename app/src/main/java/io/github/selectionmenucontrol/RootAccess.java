@@ -1,6 +1,7 @@
 package io.github.selectionmenucontrol;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.concurrent.TimeUnit;
@@ -25,7 +26,11 @@ final class RootAccess {
             try {
                 return checkWith(suCommand);
             } catch (IOException error) {
-                lastError = "无法调用 su";
+                if (isMissingExecutable(suCommand)) {
+                    lastError = "无法找到可用的 su";
+                    continue;
+                }
+                return new Result(false, "无法调用 su");
             } catch (InterruptedException error) {
                 Thread.currentThread().interrupt();
                 return new Result(false, "Root 检测被中断");
@@ -43,13 +48,18 @@ final class RootAccess {
         for (String suCommand : SU_COMMANDS) {
             try {
                 Process process = start(suCommand, command);
-                if (!process.waitFor(3, TimeUnit.SECONDS)) {
-                    process.destroyForcibly();
+                try {
+                    if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                        return false;
+                    }
+                    return process.exitValue() == 0;
+                } finally {
+                    closeProcess(process);
+                }
+            } catch (IOException error) {
+                if (!isMissingExecutable(suCommand)) {
                     return false;
                 }
-                return process.exitValue() == 0;
-            } catch (IOException error) {
-                // Only fall back when the candidate executable does not exist.
             } catch (InterruptedException error) {
                 Thread.currentThread().interrupt();
                 return false;
@@ -60,16 +70,19 @@ final class RootAccess {
 
     private static Result checkWith(String suCommand) throws IOException, InterruptedException {
         Process process = start(suCommand, "id");
-        if (!process.waitFor(3, TimeUnit.SECONDS)) {
-            process.destroyForcibly();
-            return new Result(false, "Root 授权请求超时");
+        try {
+            if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                return new Result(false, "Root 授权请求超时");
+            }
+            String output = readOutput(process);
+            if (process.exitValue() == 0 && ROOT_ID.matcher(output).find()) {
+                return new Result(true, "已获得 uid=0");
+            }
+            return new Result(false, process.exitValue() == 0
+                    ? "su 返回的身份不是 uid=0" : "Root 请求被拒绝");
+        } finally {
+            closeProcess(process);
         }
-        String output = readOutput(process);
-        if (process.exitValue() == 0 && ROOT_ID.matcher(output).find()) {
-            return new Result(true, "已获得 uid=0");
-        }
-        return new Result(false, process.exitValue() == 0
-                ? "su 返回的身份不是 uid=0" : "Root 请求被拒绝");
     }
 
     private static Process start(String suCommand, String command) throws IOException {
@@ -87,6 +100,36 @@ final class RootAccess {
             }
         }
         return output.toString();
+    }
+
+    private static boolean isMissingExecutable(String suCommand) {
+        if (suCommand.indexOf('/') >= 0) {
+            return !new File(suCommand).isFile();
+        }
+        String path = System.getenv("PATH");
+        if (path == null) {
+            return false;
+        }
+        for (String directory : path.split(File.pathSeparator)) {
+            if (new File(directory, suCommand).isFile()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void closeProcess(Process process) throws InterruptedException {
+        if (process.isAlive()) {
+            process.destroyForcibly();
+            process.waitFor(500, TimeUnit.MILLISECONDS);
+        }
+        try {
+            process.getInputStream().close();
+            process.getErrorStream().close();
+            process.getOutputStream().close();
+        } catch (IOException ignored) {
+            // Streams are best-effort cleanup after the command has completed.
+        }
     }
 
     static final class Result {

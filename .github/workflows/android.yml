@@ -68,8 +68,8 @@ jobs:
           body: |
             ## 改进
 
-            - 更新检查改用 Release 页面并增加本地缓存，减少重复请求失败。
-            - 关于页面新增自动检测更新开关。
+            - 兼容主流 Root 管理器的标准 su 检测入口。
+            - 完善 Root 命令超时后的进程与流清理。
       - name: Prepare LSPosed mirror release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
