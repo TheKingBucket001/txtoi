@@ -23,6 +23,24 @@
 
 模块只处理文字选择菜单中的扩展项，不读取选中文字，也不修改系统 APK 或其他应用。
 
+## 效果对比
+
+<table>
+  <tr>
+    <td width="32%" align="center" valign="top">
+      <strong>未使用模块</strong><br />
+      <sub>处理文本扩展项会展开</sub><br /><br />
+      <img src="assets/menu-before.png" width="260" alt="未使用文本选择菜单控制时，文字选择菜单中出现多个处理文本扩展项" />
+    </td>
+    <td width="8%" align="center" valign="middle"><strong>&rarr;</strong></td>
+    <td width="60%" align="center" valign="top">
+      <strong>使用模块后</strong><br />
+      <sub>隐藏不需要的扩展项，只保留系统操作</sub><br /><br />
+      <img src="assets/menu-after.png" width="520" alt="使用文本选择菜单控制后，文字选择菜单只保留系统操作" />
+    </td>
+  </tr>
+</table>
+
 ## 模块功能
 
 - 扫描并列出已安装的文字处理扩展项。
