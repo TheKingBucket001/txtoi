@@ -77,8 +77,7 @@ jobs:
           body: |
             ## 改进
 
-            - 兼容主流 Root 管理器的标准 su 检测入口。
-            - 完善 Root 命令超时后的进程与流清理。
+            - 关于页面改为固定布局，打开后无需滑动。
       - name: Prepare LSPosed mirror release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |

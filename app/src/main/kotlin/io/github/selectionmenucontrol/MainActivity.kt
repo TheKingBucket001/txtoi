@@ -611,86 +611,75 @@ private fun AboutScreen(
     autoCheckEnabled: Boolean,
     onAutoCheckChange: (Boolean) -> Unit,
 ) {
-    LazyColumn(
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .background(MiuixTheme.colorScheme.background)
             .statusBarsPadding()
             .navigationBarsPadding(),
-        contentPadding = PaddingValues(bottom = 16.dp),
     ) {
-        item {
-            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) {
-                    Image(
-                        painter = painterResource(R.drawable.ic_back),
-                        contentDescription = "返回",
-                        modifier = Modifier.size(24.dp),
-                    )
-                }
-                Text(
-                    "关于文本菜单",
-                    style = MiuixTheme.textStyles.subtitle,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 19.sp,
-                    maxLines = 1,
-                    softWrap = false,
-                    modifier = Modifier.weight(1f),
-                    textAlign = TextAlign.Center,
+        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Image(
+                    painter = painterResource(R.drawable.ic_back),
+                    contentDescription = "返回",
+                    modifier = Modifier.size(24.dp),
                 )
-                Spacer(Modifier.width(48.dp))
             }
+            Text(
+                "关于文本菜单",
+                style = MiuixTheme.textStyles.subtitle,
+                fontWeight = FontWeight.Bold,
+                fontSize = 19.sp,
+                maxLines = 1,
+                softWrap = false,
+                modifier = Modifier.weight(1f),
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.width(48.dp))
         }
-        item {
-            Card(
-                modifier = Modifier
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
-                    .clip(RoundedCornerShape(24.dp)),
+
+        Card(
+            modifier = Modifier
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .clip(RoundedCornerShape(24.dp)),
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().background(Color(0xFFF0F6FF)).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                Column(
-                    modifier = Modifier.fillMaxWidth().background(Color(0xFFF0F6FF)).padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Image(painter = painterResource(R.drawable.ic_module), contentDescription = null, modifier = Modifier.size(64.dp))
-                    Text("系统文本菜单", color = Color(0xFF1976D2), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    Text("文本菜单控制", fontWeight = FontWeight.Bold, fontSize = 28.sp, color = Color(0xFF171717))
-                    Text("管理全系统文本选择菜单中的 PROCESS_TEXT 扩展项。", color = Color(0xFF5E6570), fontSize = 15.sp, lineHeight = 22.sp)
-                }
+                Image(painter = painterResource(R.drawable.ic_module), contentDescription = null, modifier = Modifier.size(56.dp))
+                Text("系统文本菜单", color = Color(0xFF1976D2), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                Text("文本菜单控制", fontWeight = FontWeight.Bold, fontSize = 26.sp, color = Color(0xFF171717))
+                Text("管理全系统文本选择菜单中的 PROCESS_TEXT 扩展项。", color = Color(0xFF5E6570), fontSize = 14.sp, lineHeight = 20.sp)
             }
         }
-        item {
-            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-                AboutInfoRow("当前版本", BuildConfig.VERSION_NAME)
-                AboutInfoDivider()
-                AboutInfoRow("模块 ID", "txtoi")
-                AboutInfoDivider()
-                AboutInfoRow("维护者", "Bucket")
+
+        Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+            AboutInfoRow("当前版本", BuildConfig.VERSION_NAME)
+            AboutInfoDivider()
+            AboutInfoRow("模块 ID", "txtoi")
+            AboutInfoDivider()
+            AboutInfoRow("维护者", "Bucket")
+        }
+
+        Text("项目", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 8.dp, bottom = 2.dp))
+        Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+            AboutActionRow("查看源代码", "GitHub · TheKingBucket001/txtoi", "GitHub") {
+                activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/TheKingBucket001/txtoi")))
             }
+            AboutInfoDivider()
+            AboutActionRow("开源许可证", "GNU General Public License v3.0", "GPL-3.0", null)
         }
-        item {
-            Text("项目", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 14.dp, bottom = 4.dp))
-        }
-        item {
-            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-                AboutActionRow("查看源代码", "GitHub · TheKingBucket001/txtoi", "GitHub") {
-                    activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/TheKingBucket001/txtoi")))
-                }
-                AboutInfoDivider()
-                AboutActionRow("开源许可证", "GNU General Public License v3.0", "GPL-3.0", null)
-            }
-        }
-        item {
-            Text("更新", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 14.dp, bottom = 4.dp))
-        }
-        item {
-            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-                SwitchPreference(
-                    checked = autoCheckEnabled,
-                    onCheckedChange = onAutoCheckChange,
-                    title = "自动检测更新",
-                    summary = "打开模块时检测新版本",
-                )
-            }
+
+        Text("更新", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 8.dp, bottom = 2.dp))
+        Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+            SwitchPreference(
+                checked = autoCheckEnabled,
+                onCheckedChange = onAutoCheckChange,
+                title = "自动检测更新",
+                summary = "打开模块时检测新版本",
+            )
         }
     }
 }
