@@ -73,7 +73,6 @@
 | 主页 | [TheKingBucket001/txtoi](https://github.com/TheKingBucket001/txtoi) |
 | 源代码 | [TheKingBucket001/txtoi](https://github.com/TheKingBucket001/txtoi) |
 | 问题反馈 | [Issues](https://github.com/TheKingBucket001/txtoi/issues) |
-| LSPosed 镜像 | [Xposed Modules Repository](https://github.com/Xposed-Modules-Repo/io.github.selectionmenucontrol) |
 
 ## 许可证
 
