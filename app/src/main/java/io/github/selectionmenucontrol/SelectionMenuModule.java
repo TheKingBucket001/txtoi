@@ -21,8 +21,10 @@ import io.github.libxposed.api.XposedModuleInterface;
 @SuppressLint({"PrivateApi", "DiscouragedPrivateApi", "StaticFieldLeak"})
 public final class SelectionMenuModule extends XposedModule {
     private static final long RULE_CACHE_MS = 1500L;
+    private static final long STATUS_REPORT_INTERVAL_MS = 30_000L;
     private static volatile SystemRuleStore.Snapshot cachedRules = SystemRuleStore.Snapshot.empty();
     private static volatile long nextRefreshAt;
+    private static volatile long lastStatusReportAt;
     private static volatile Context systemContext;
 
     @Override
@@ -127,7 +129,13 @@ public final class SelectionMenuModule extends XposedModule {
     private void reportLoaded() {
         Context context = getSystemContext();
         if (context != null) {
-            SystemRuleStore.reportSystemServerLoaded(context);
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastStatusReportAt < STATUS_REPORT_INTERVAL_MS) {
+                return;
+            }
+            if (SystemRuleStore.reportSystemServerLoaded(context)) {
+                lastStatusReportAt = now;
+            }
         } else {
             log(android.util.Log.WARN, "SelectionMenuControl", "System context is unavailable; status heartbeat deferred");
         }

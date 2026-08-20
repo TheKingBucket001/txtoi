@@ -147,11 +147,12 @@ private fun ModuleApp(activity: MainActivity) {
     var showAbout by remember { mutableStateOf(false) }
     var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
     var autoCheckEnabled by remember { mutableStateOf(UpdateSettings.isAutoCheckEnabled(activity)) }
+    val autoCheckOnLaunch = remember { autoCheckEnabled }
 
     // This effect belongs to the Activity's root composition, so page navigation and
-    // environment refreshes cannot start another check during the same app session.
-    LaunchedEffect(autoCheckEnabled) {
-        if (!autoCheckEnabled) return@LaunchedEffect
+    // setting changes cannot start another check during the same app session.
+    LaunchedEffect(Unit) {
+        if (!autoCheckOnLaunch) return@LaunchedEffect
         when (val result = withContext(Dispatchers.IO) { checkForUpdate(activity) }) {
             is UpdateCheckResult.Available -> availableUpdate = result.update
             UpdateCheckResult.UpToDate -> Toast.makeText(activity, "暂无更新", Toast.LENGTH_SHORT).show()

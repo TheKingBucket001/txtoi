@@ -77,7 +77,8 @@ jobs:
           body: |
             ## 改进
 
-            - 关于页面改为固定布局，打开后无需滑动。
+            - 自动检测更新在同一次打开应用期间只执行一次，切换开关不会重复请求。
+            - 文本菜单 Hook 心跳增加节流，减少频繁打开菜单时的额外 I/O。
       - name: Prepare LSPosed mirror release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |

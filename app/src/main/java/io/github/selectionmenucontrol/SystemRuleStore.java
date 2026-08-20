@@ -86,16 +86,19 @@ final class SystemRuleStore {
         }
     }
 
-    static void reportSystemServerLoaded(Context context) {
+    static boolean reportSystemServerLoaded(Context context) {
         long identity = Binder.clearCallingIdentity();
         try {
             Bundle extras = new Bundle();
             extras.putInt(EXTRA_BOOT_COUNT, getBootCount(context));
             extras.putLong(EXTRA_LOADED_AT, System.currentTimeMillis());
             extras.putInt(EXTRA_MODULE_VERSION, BuildConfig.VERSION_CODE);
-            context.getContentResolver().call(RULES_URI, METHOD_REPORT_SYSTEM_SERVER, null, extras);
+            Bundle result = context.getContentResolver().call(
+                    RULES_URI, METHOD_REPORT_SYSTEM_SERVER, null, extras);
+            return result != null && result.getBoolean("accepted", false);
         } catch (Throwable error) {
             Log.w(TAG, "Unable to report system_server status", error);
+            return false;
         } finally {
             Binder.restoreCallingIdentity(identity);
         }
