@@ -349,6 +349,7 @@ private const val UPDATE_CACHE_VALIDITY_MS = 60L * 60L * 1_000L
 private const val UPDATE_LOG_TAG = "SelectionMenuControl"
 
 private fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.HookStatus {
+    val request = SystemRuleStore.beginProbe(activity) ?: return SystemRuleStore.HookStatus.unavailable()
     val deadline = System.currentTimeMillis() + 2_000L
     try {
         do {
@@ -356,14 +357,21 @@ private fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.Hook
                 Intent(Intent.ACTION_PROCESS_TEXT).setType("text/plain"),
                 PackageManager.MATCH_ALL,
             )
-            Thread.sleep(150)
-            val status = SystemRuleStore.readHookStatus(activity)
-            if (status.loadedForCurrentBoot) return status
+            Thread.sleep(100)
+            val status = SystemRuleStore.readProbeResponse(activity, request)
+            if (status.loadedForCurrentBoot) {
+                SystemRuleStore.cancelProbe(request)
+                return status
+            }
         } while (System.currentTimeMillis() < deadline)
     } catch (_: Throwable) {
-        // The final status read keeps the page locked if PackageManager cannot be queried.
+        // The final probe read keeps the page locked if PackageManager cannot be queried.
     }
-    return SystemRuleStore.readHookStatus(activity)
+    val status = SystemRuleStore.readProbeResponse(activity, request)
+    if (!status.loadedForCurrentBoot) {
+        SystemRuleStore.cancelProbe(request)
+    }
+    return status
 }
 
 @Composable
@@ -464,7 +472,7 @@ private fun GateRow(title: String, passed: Boolean, summary: String) {
 
 @Composable
 private fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
-    var snapshot by remember { mutableStateOf(SystemRuleStore.read(activity)) }
+    var snapshot by remember { mutableStateOf(SystemRuleStore.readApp(activity)) }
     var processors by remember { mutableStateOf<List<Processor>?>(null) }
     var saving by remember { mutableStateOf(false) }
     var showRestoreConfirm by remember { mutableStateOf(false) }
@@ -489,7 +497,7 @@ private fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                     snapshot = SystemRuleStore.Snapshot(nextHidden)
                     Toast.makeText(activity, "隐藏规则已保存", Toast.LENGTH_SHORT).show()
                 } else {
-                    snapshot = SystemRuleStore.read(activity)
+                    snapshot = SystemRuleStore.readApp(activity)
                     Toast.makeText(activity, "规则保存失败", Toast.LENGTH_LONG).show()
                 }
             }

@@ -68,6 +68,34 @@ final class RootAccess {
         return false;
     }
 
+    static boolean deleteGlobalSetting(String key) {
+        if (key == null || !key.matches("[a-z0-9_]+")) {
+            return false;
+        }
+        String command = "/system/bin/settings delete global " + key;
+        for (String suCommand : SU_COMMANDS) {
+            try {
+                Process process = start(suCommand, command);
+                try {
+                    if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                        return false;
+                    }
+                    return process.exitValue() == 0;
+                } finally {
+                    closeProcess(process);
+                }
+            } catch (IOException error) {
+                if (!isMissingExecutable(suCommand)) {
+                    return false;
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
     private static Result checkWith(String suCommand) throws IOException, InterruptedException {
         Process process = start(suCommand, "id");
         try {

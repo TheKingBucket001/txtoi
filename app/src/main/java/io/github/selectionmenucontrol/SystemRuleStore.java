@@ -1,10 +1,7 @@
 package io.github.selectionmenucontrol;
 
 import android.content.Context;
-import android.database.Cursor;
-import android.net.Uri;
 import android.os.Binder;
-import android.os.Bundle;
 import android.provider.Settings;
 import android.util.Log;
 import android.util.Base64;
@@ -14,93 +11,88 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.UUID;
 
 final class SystemRuleStore {
     private static final String TAG = "SelectionMenuControl";
     static final String SETTING_KEY = "selection_menu_control_rules_v1";
-    static final String RULES_AUTHORITY = "io.github.selectionmenucontrol.rules";
-    static final String RULES_PATH = "rules";
-    static final String COLUMN_RULES = "rules";
-    static final String COLUMN_HOOK_BOOT_COUNT = "hook_boot_count";
-    static final String COLUMN_HOOK_LOADED_AT = "hook_loaded_at";
-    static final String COLUMN_HOOK_MODULE_VERSION = "hook_module_version";
-    static final String METHOD_REPORT_SYSTEM_SERVER = "report_system_server_loaded";
-    static final String EXTRA_BOOT_COUNT = "boot_count";
-    static final String EXTRA_LOADED_AT = "loaded_at";
-    static final String EXTRA_MODULE_VERSION = "module_version";
+    static final String PROBE_REQUEST_KEY = "selection_menu_control_probe_request_v1";
+    static final String PROBE_RESPONSE_KEY = "selection_menu_control_probe_response_v1";
     static final String PREFERENCES_NAME = "selection_menu_control_rules";
-    private static final Uri RULES_URI = new Uri.Builder()
-            .scheme("content")
-            .authority(RULES_AUTHORITY)
-            .appendPath(RULES_PATH)
-            .build();
     private static final String FORMAT_PREFIX = "v2:";
+    private static final String PROBE_PREFIX = "v1:";
+    private static final String PROBE_PENDING_RESPONSE = "v1:pending:0:0:0";
+    private static final long PROBE_VALIDITY_MS = 5_000L;
 
     private SystemRuleStore() {
     }
 
     static Snapshot read(Context context) {
         String globalRules = readGlobalRules(context);
+        return globalRules == null ? Snapshot.empty() : decode(globalRules);
+    }
+
+    static Snapshot readApp(Context context) {
+        String globalRules = readGlobalRules(context);
         if (globalRules != null) {
             return decode(globalRules);
         }
-        // Keep the old provider path only for one-time migration from earlier releases.
-        long identity = Binder.clearCallingIdentity();
-        try (Cursor cursor = context.getContentResolver().query(RULES_URI, null, null, null, null)) {
-            if (cursor == null || !cursor.moveToFirst()) {
-                return Snapshot.empty();
-            }
-            int column = cursor.getColumnIndex(COLUMN_RULES);
-            return column < 0 ? Snapshot.empty() : decode(cursor.getString(column));
-        } catch (Throwable error) {
-            Log.w(TAG, "Unable to read rules from the module provider", error);
-            return Snapshot.empty();
-        } finally {
-            Binder.restoreCallingIdentity(identity);
-        }
+        String legacyRules = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+                .getString(SETTING_KEY, null);
+        return legacyRules == null ? Snapshot.empty() : decode(legacyRules);
     }
 
-    static HookStatus readHookStatus(Context context) {
-        try (Cursor cursor = context.getContentResolver().query(RULES_URI, null, null, null, null)) {
-            if (cursor == null || !cursor.moveToFirst()) {
+    static ProbeRequest beginProbe(Context context) {
+        String nonce = UUID.randomUUID().toString().replace("-", "");
+        long issuedAt = System.currentTimeMillis();
+        String request = PROBE_PREFIX + nonce + ":" + issuedAt;
+        RootAccess.deleteGlobalSetting(PROBE_REQUEST_KEY);
+        if (!RootAccess.putGlobalSetting(PROBE_RESPONSE_KEY, PROBE_PENDING_RESPONSE)) {
+            return null;
+        }
+        if (!RootAccess.putGlobalSetting(PROBE_REQUEST_KEY, request)) {
+            RootAccess.deleteGlobalSetting(PROBE_RESPONSE_KEY);
+            return null;
+        }
+        return new ProbeRequest(nonce, issuedAt);
+    }
+
+    static HookStatus readProbeResponse(Context context, ProbeRequest request) {
+        if (request == null) {
+            return HookStatus.unavailable();
+        }
+        try {
+            String response = readGlobalValue(context, PROBE_RESPONSE_KEY);
+            if (response == null) {
                 return HookStatus.unavailable();
             }
-            int bootColumn = cursor.getColumnIndex(COLUMN_HOOK_BOOT_COUNT);
-            int loadedColumn = cursor.getColumnIndex(COLUMN_HOOK_LOADED_AT);
-            int versionColumn = cursor.getColumnIndex(COLUMN_HOOK_MODULE_VERSION);
-            if (bootColumn < 0 || loadedColumn < 0 || versionColumn < 0) {
+            String[] parts = response.split(":", -1);
+            if (parts.length != 5 || !"v1".equals(parts[0])) {
                 return HookStatus.unavailable();
             }
+            if (!request.nonce.equals(parts[1])) {
+                return HookStatus.unavailable();
+            }
+            int reportedBoot = Integer.parseInt(parts[2]);
+            int reportedVersion = Integer.parseInt(parts[3]);
+            long loadedAt = Long.parseLong(parts[4]);
+            long now = System.currentTimeMillis();
             int currentBoot = getBootCount(context);
-            int reportedBoot = cursor.getInt(bootColumn);
-            long loadedAt = cursor.getLong(loadedColumn);
-            int reportedVersion = cursor.getInt(versionColumn);
-            return new HookStatus(
-                    currentBoot >= 0
-                            && currentBoot == reportedBoot
-                            && loadedAt > 0
-                            && reportedVersion == BuildConfig.VERSION_CODE,
-                    loadedAt);
+            boolean valid = currentBoot >= 0
+                    && currentBoot == reportedBoot
+                    && reportedVersion == BuildConfig.VERSION_CODE
+                    && loadedAt >= request.issuedAt
+                    && loadedAt <= now + 1_000L
+                    && now - loadedAt <= PROBE_VALIDITY_MS;
+            return new HookStatus(valid, loadedAt);
         } catch (Throwable ignored) {
             return HookStatus.unavailable();
         }
     }
 
-    static boolean reportSystemServerLoaded(Context context) {
-        long identity = Binder.clearCallingIdentity();
-        try {
-            Bundle extras = new Bundle();
-            extras.putInt(EXTRA_BOOT_COUNT, getBootCount(context));
-            extras.putLong(EXTRA_LOADED_AT, System.currentTimeMillis());
-            extras.putInt(EXTRA_MODULE_VERSION, BuildConfig.VERSION_CODE);
-            Bundle result = context.getContentResolver().call(
-                    RULES_URI, METHOD_REPORT_SYSTEM_SERVER, null, extras);
-            return result != null && result.getBoolean("accepted", false);
-        } catch (Throwable error) {
-            Log.w(TAG, "Unable to report system_server status", error);
-            return false;
-        } finally {
-            Binder.restoreCallingIdentity(identity);
+    static void cancelProbe(ProbeRequest request) {
+        if (request != null) {
+            RootAccess.deleteGlobalSetting(PROBE_REQUEST_KEY);
         }
     }
 
@@ -129,11 +121,69 @@ final class SystemRuleStore {
     }
 
     private static String readGlobalRules(Context context) {
+        return readGlobalValue(context, SETTING_KEY);
+    }
+
+    private static String readGlobalValue(Context context, String key) {
         long identity = Binder.clearCallingIdentity();
         try {
-            return Settings.Global.getString(context.getContentResolver(), SETTING_KEY);
+            return Settings.Global.getString(context.getContentResolver(), key);
         } catch (Throwable ignored) {
             return null;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+    }
+
+    static String respondToProbe(Context context, String lastRespondedNonce) {
+        String request = readGlobalValue(context, PROBE_REQUEST_KEY);
+        if (request == null || request.isEmpty()) {
+            return null;
+        }
+        try {
+            String[] parts = request.split(":", -1);
+            if (parts.length != 3 || !"v1".equals(parts[0])) {
+                clearProbeRequest(context);
+                return null;
+            }
+            long issuedAt = Long.parseLong(parts[2]);
+            long now = System.currentTimeMillis();
+            if (parts[1].isEmpty() || now < issuedAt || now - issuedAt > PROBE_VALIDITY_MS) {
+                clearProbeRequest(context);
+                return null;
+            }
+            if (parts[1].equals(lastRespondedNonce)) {
+                return null;
+            }
+            int bootCount = getBootCount(context);
+            if (bootCount < 0) {
+                return null;
+            }
+            String response = PROBE_PREFIX + parts[1] + ":" + bootCount + ":"
+                    + BuildConfig.VERSION_CODE + ":" + now;
+            long identity = Binder.clearCallingIdentity();
+            try {
+                boolean accepted = Settings.Global.putString(
+                        context.getContentResolver(), PROBE_RESPONSE_KEY, response);
+                if (accepted) {
+                    Settings.Global.putString(context.getContentResolver(), PROBE_REQUEST_KEY, null);
+                    return parts[1];
+                }
+            } finally {
+                Binder.restoreCallingIdentity(identity);
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to respond to system hook probe", error);
+        }
+        return null;
+    }
+
+    private static void clearProbeRequest(Context context) {
+        long identity = Binder.clearCallingIdentity();
+        try {
+            Settings.Global.putString(context.getContentResolver(), PROBE_REQUEST_KEY, null);
+        } catch (Throwable ignored) {
+            // Best-effort cleanup; invalid requests are ignored on subsequent probes.
         } finally {
             Binder.restoreCallingIdentity(identity);
         }
@@ -200,6 +250,16 @@ final class SystemRuleStore {
 
         static HookStatus unavailable() {
             return new HookStatus(false, 0L);
+        }
+    }
+
+    static final class ProbeRequest {
+        final String nonce;
+        final long issuedAt;
+
+        ProbeRequest(String nonce, long issuedAt) {
+            this.nonce = nonce;
+            this.issuedAt = issuedAt;
         }
     }
 }

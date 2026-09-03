@@ -6,8 +6,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ResolveInfo;
 import android.os.SystemClock;
-import android.os.Handler;
-import android.os.Looper;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -21,11 +19,10 @@ import io.github.libxposed.api.XposedModuleInterface;
 @SuppressLint({"PrivateApi", "DiscouragedPrivateApi", "StaticFieldLeak"})
 public final class SelectionMenuModule extends XposedModule {
     private static final long RULE_CACHE_MS = 1500L;
-    private static final long STATUS_REPORT_INTERVAL_MS = 30_000L;
     private static volatile SystemRuleStore.Snapshot cachedRules = SystemRuleStore.Snapshot.empty();
     private static volatile long nextRefreshAt;
-    private static volatile long lastStatusReportAt;
     private static volatile Context systemContext;
+    private static volatile String lastRespondedProbeNonce;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -51,8 +48,6 @@ public final class SelectionMenuModule extends XposedModule {
                     boolean.class,
                     boolean.class);
             hook(target).intercept(this::interceptProcessTextQuery);
-            reportLoaded();
-            scheduleStatusReport();
             log(android.util.Log.INFO, "SelectionMenuControl", "Hooked ComputerEngine 9-argument queryIntentActivitiesInternal");
         } catch (Throwable error) {
             log(android.util.Log.ERROR, "SelectionMenuControl", "ComputerEngine hook not installed", error);
@@ -60,16 +55,18 @@ public final class SelectionMenuModule extends XposedModule {
     }
 
     private Object interceptProcessTextQuery(XposedInterface.Chain chain) throws Throwable {
+        Intent intent = findIntentArgument(chain.getArgs());
+        boolean processText = intent != null && Intent.ACTION_PROCESS_TEXT.equals(intent.getAction());
+        if (processText) {
+            respondToProbe();
+        }
         Object result = chain.proceed();
         if (!(result instanceof List<?>)) {
             return result;
         }
-        Intent intent = findIntentArgument(chain.getArgs());
-        if (intent == null || !Intent.ACTION_PROCESS_TEXT.equals(intent.getAction())) {
+        if (!processText) {
             return result;
         }
-        // The provider can be unavailable during direct boot. Refresh the proof once a real query arrives.
-        reportLoaded();
         SystemRuleStore.Snapshot rules = readRules();
         if (rules.hiddenComponents.isEmpty()) {
             return result;
@@ -126,26 +123,13 @@ public final class SelectionMenuModule extends XposedModule {
         return context == null ? SystemRuleStore.Snapshot.empty() : SystemRuleStore.read(context);
     }
 
-    private void reportLoaded() {
+    private void respondToProbe() {
         Context context = getSystemContext();
         if (context != null) {
-            long now = SystemClock.elapsedRealtime();
-            if (now - lastStatusReportAt < STATUS_REPORT_INTERVAL_MS) {
-                return;
+            String nonce = SystemRuleStore.respondToProbe(context, lastRespondedProbeNonce);
+            if (nonce != null) {
+                lastRespondedProbeNonce = nonce;
             }
-            if (SystemRuleStore.reportSystemServerLoaded(context)) {
-                lastStatusReportAt = now;
-            }
-        } else {
-            log(android.util.Log.WARN, "SelectionMenuControl", "System context is unavailable; status heartbeat deferred");
-        }
-    }
-
-    private void scheduleStatusReport() {
-        try {
-            new Handler(Looper.getMainLooper()).postDelayed(this::reportLoaded, 1000L);
-        } catch (Throwable ignored) {
-            // The next PROCESS_TEXT query retries the report if the system looper is unavailable.
         }
     }
 

@@ -29,11 +29,5 @@
             </intent-filter>
         </activity>
 
-        <provider
-            android:name=".RulesProvider"
-            android:authorities="io.github.selectionmenucontrol.rules"
-            android:exported="true"
-            android:grantUriPermissions="false"
-            tools:ignore="ExportedContentProvider" />
     </application>
 </manifest>

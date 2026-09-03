@@ -77,8 +77,8 @@ jobs:
           body: |
             ## 改进
 
-            - 自动检测更新在同一次打开应用期间只执行一次，切换开关不会重复请求。
-            - 文本菜单 Hook 心跳增加节流，减少频繁打开菜单时的额外 I/O。
+            - 环境检测改为一次性 Global challenge-response，不再通过应用 Provider 回报状态。
+            - 文本菜单查询不再触碰应用进程，避免 Android 关联启动记录。
       - name: Prepare LSPosed mirror release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
