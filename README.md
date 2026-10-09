@@ -6,7 +6,7 @@
 
 **ColorOS 16 的文字选择菜单控制模块**
 
-当前版本：`v0.6.1`
+当前版本：`v0.6.2`
 
 [![Release](https://img.shields.io/github/v/release/TheKingBucket001/txtoi?display_name=tag&label=release&color=brightgreen)](https://github.com/TheKingBucket001/txtoi/releases/latest)
 [![CI](https://github.com/TheKingBucket001/txtoi/actions/workflows/android.yml/badge.svg?branch=main)](https://github.com/TheKingBucket001/txtoi/actions/workflows/android.yml)
@@ -47,7 +47,7 @@
 
 - **隐藏与显示**：自动列出手机上的文字处理扩展项。勾选后隐藏，取消勾选即可恢复显示；隐藏的项目仍保留在设置列表中。
 - **拖动排序**：拖动左侧手柄调整顺序，松手后自动保存，保存成功会提示“已保存”。已隐藏的项目需要先恢复显示，才能拖动。
-- **固定项提示**：固定项与其他选项按顺序显示在同一列表中，不单独置顶。这类选项可以隐藏，但不能拖动；调整排序时会保留它们原来的位置。
+- **菜单顺序**：列表默认按当前系统生成的菜单顺序排列，再应用你保存的排序。固定项与可移动项在同一列表中；固定项可以隐藏，但不能拖动，调整其他项目时保留它们的位置。
 - **分别恢复**：“恢复默认排序”保留隐藏设置；“恢复全部显示”保留当前排序。
 - **设置保留**：重启手机、更新模块或退出模块应用后，已保存的隐藏和排序设置都会保留。
 - **列表操作**：标题和恢复按钮始终可见。列表较长时，拖动到上、下边缘会自动滚动，方便继续调整顺序。

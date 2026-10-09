@@ -105,10 +105,12 @@ public final class SelectionMenuModule extends XposedModule {
                 try {
                     Context context = getSystemContext();
                     SystemMenuClassifier classifier = getMenuClassifier();
-                    for (int index = 0; index < resolved.size(); index++) {
-                        ResolveInfo entry = resolved.get(index);
-                        classifications.put(entry, classifier == null ? SystemMenuClassifier.UNKNOWN
-                                : classifier.classify(context, entry, index));
+                    if (classifier != null) {
+                        SystemMenuClassifier.Result policy = classifier.evaluate(context, resolved, originalQuery);
+                        classifications = policy.classifications;
+                        // Only the module UI receives the system toolbar's display order.
+                        // Host queries retain their PM slots before applying ordinary rules.
+                        if (originalQuery) resolved = policy.displayOrder;
                     }
                 } finally {
                     Binder.restoreCallingIdentity(identity);
@@ -131,8 +133,9 @@ public final class SelectionMenuModule extends XposedModule {
                 respondToProbe();
                 return annotatedResult;
             }
+            Map<ResolveInfo, Integer> effectiveClassifications = classifications;
             List<ResolveInfo> filtered = rules.apply(resolved, SelectionMenuModule::componentOf,
-                    entry -> classifications.getOrDefault(entry, SystemMenuClassifier.UNKNOWN) != SystemMenuClassifier.ORDINARY);
+                    entry -> effectiveClassifications.getOrDefault(entry, SystemMenuClassifier.UNKNOWN) != SystemMenuClassifier.ORDINARY);
             // Keep the original slice and ResolveInfo objects untouched. No internal resolution
             // query is filtered or reordered, including resolveActivity with resolveForStart=false.
             Object effectiveResult = filtered.equals(original) ? result : newSlice.newInstance(filtered);
