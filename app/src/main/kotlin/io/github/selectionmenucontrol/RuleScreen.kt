@@ -91,7 +91,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.window.WindowDialog
 import kotlin.math.roundToInt
 
-private data class Processor(
+internal data class Processor(
     val component: String,
     val label: String,
     val summary: String,
@@ -129,7 +129,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     val emptySnapshot = remember { SystemRuleStore.Snapshot.empty() }
     val snapshot = saveState?.value ?: emptySnapshot
     var originalProcessors by remember { mutableStateOf(emptyList<Processor>()) }
-    var ordinaryProcessors by remember { mutableStateOf(emptyList<Processor>()) }
+    var displayedProcessors by remember { mutableStateOf(emptyList<Processor>()) }
     var initializing by remember { mutableStateOf(true) }
     var initializationError by remember { mutableStateOf<String?>(null) }
     var loadSignal by remember { mutableIntStateOf(0) }
@@ -142,8 +142,6 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     val windowFocused = LocalWindowInfo.current.isWindowFocused
     val canChange = !initializing && initializationError == null && snapshot.valid
     val canUseActions = canChange && dragSession == null
-    val fixedProcessors = originalProcessors.filter { it.fixed }
-    val displayedProcessors = fixedProcessors + ordinaryProcessors
     val gripStart = with(density) { 16.dp.toPx() }
     val gripEnd = with(density) { 64.dp.toPx() }
     val rowGap = with(density) { 3.dp.toPx() }
@@ -156,8 +154,8 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     fun cancelDrag() {
         val current = dragSession ?: return
         dragSession = null
-        val byComponent = ordinaryProcessors.associateBy { it.component }
-        ordinaryProcessors = current.startOrder.mapNotNull(byComponent::get)
+        val byComponent = displayedProcessors.associateBy { it.component }
+        displayedProcessors = current.startOrder.mapNotNull(byComponent::get)
     }
 
     LaunchedEffect(loadSignal) {
@@ -188,7 +186,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         }
         if (result.error == null && result.snapshot.valid) editor.initialize(activity, result.snapshot, beforeLoad)
         originalProcessors = result.processors
-        ordinaryProcessors = applyOrder(result.processors, editor.state.value?.value?.orderedComponents ?: result.snapshot.orderedComponents)
+        displayedProcessors = applyOrder(result.processors, editor.state.value?.value?.orderedComponents ?: result.snapshot.orderedComponents)
         initializationError = result.error
         initializing = false
     }
@@ -197,7 +195,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         if (editor.consumeFailure()) {
             dragSession = null
             val actual = editor.state.value?.value ?: return@LaunchedEffect
-            ordinaryProcessors = applyOrder(originalProcessors, actual.orderedComponents)
+            displayedProcessors = applyOrder(originalProcessors, actual.orderedComponents)
             if (!actual.valid) initializationError = "规则数据无法读取，请恢复备份后重试"
             Toast.makeText(activity, "保存失败，已重新读取当前规则", Toast.LENGTH_LONG).show()
         }
@@ -213,14 +211,14 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
 
     fun save(next: SystemRuleStore.Snapshot) {
         if (initializing || initializationError != null || editor.state.value?.value?.valid != true || dragSession != null) return
-        ordinaryProcessors = applyOrder(originalProcessors, next.orderedComponents)
+        displayedProcessors = applyOrder(originalProcessors, next.orderedComponents)
         editor.save(next)
     }
 
     fun saveOrder() {
         val current = editor.state.value?.value ?: return
         val fixed = originalProcessors.filter { it.fixed }.mapTo(HashSet()) { it.component }
-        val ordered = mergeOrder(current.orderedComponents, ordinaryProcessors.map { it.component }, fixed)
+        val ordered = mergeOrder(current.orderedComponents, displayedProcessors.map { it.component }, fixed)
         save(SystemRuleStore.Snapshot(current.hiddenComponents, ordered))
     }
 
@@ -236,11 +234,11 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     fun moveOne(component: String, direction: Int): Boolean {
         if (initializing || dragSession != null || initializationError != null) return false
         val current = editor.state.value?.value?.takeIf { it.valid } ?: return false
-        val moving = ordinaryProcessors.filter { movable(it, current.hiddenComponents) }
+        val moving = displayedProcessors.filter { movable(it, current.hiddenComponents) }
         val from = moving.indexOfFirst { it.component == component }
         val to = from + direction
         if (from < 0 || to !in moving.indices) return false
-        ordinaryProcessors = moveVisibleOrdinary(ordinaryProcessors, current.hiddenComponents, component, moving[to].component)
+        displayedProcessors = moveVisibleProcessors(displayedProcessors, current.hiddenComponents, component, moving[to].component)
         saveOrder()
         return true
     }
@@ -249,7 +247,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         val current = dragSession ?: return
         if (!commit) { cancelDrag(); return }
         dragSession = null
-        if (current.startOrder != ordinaryProcessors.map { it.component }) saveOrder()
+        if (current.startOrder != displayedProcessors.map { it.component }) saveOrder()
     }
 
     val dragCallbacks by rememberUpdatedState(RuleDragCallbacks(
@@ -266,7 +264,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
             val grabOffset = position.y - item.offset
             if (RuleDragGeometry.top(position.y, grabOffset, item.size.toFloat(), bounds) == null) return@start false
             dragSession = RuleDragSession(++dragToken, processor.component, item.size.toFloat(), grabOffset, position.y,
-                ordinaryProcessors.map { it.component })
+                displayedProcessors.map { it.component })
             true
         },
         move = { pointerY -> dragSession = dragSession?.copy(pointerY = pointerY) },
@@ -279,7 +277,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         if (active == null) {
             0f
         } else {
-            val displayed = fixedProcessors + ordinaryProcessors
+            val displayed = displayedProcessors
             val bounds = optionBounds(listState, displayed.size)
             val top = RuleDragGeometry.top(active.pointerY, active.grabOffset, active.height, bounds)
             if (top == null || !canChange) {
@@ -298,7 +296,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                     movingKeys,
                 ) else null
                 if (target != null) {
-                    ordinaryProcessors = moveVisibleOrdinary(ordinaryProcessors, hidden, active.component, target)
+                    displayedProcessors = moveVisibleProcessors(displayedProcessors, hidden, active.component, target)
                 }
                 val viewportTop = listState.layoutInfo.viewportStartOffset.toFloat()
                 val viewportBottom = listState.layoutInfo.viewportEndOffset.toFloat()
@@ -419,7 +417,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                             hidden -> "已隐藏，取消隐藏后可移动"
                             else -> null
                         }
-                        val moving = ordinaryProcessors.filter { movable(it) }
+                        val moving = displayedProcessors.filter { movable(it) }
                         val index = moving.indexOfFirst { it.component == processor.component }
                         val actions = if (canUseActions && movable(processor)) buildList {
                             if (index > 0) add(CustomAccessibilityAction("上移") { moveOne(processor.component, -1) })
@@ -624,21 +622,13 @@ private fun LockGrip(color: Color) {
     }
 }
 
-private fun moveVisibleOrdinary(original: List<Processor>, hiddenComponents: Set<String>, from: String, to: String) =
+internal fun moveVisibleProcessors(original: List<Processor>, hiddenComponents: Set<String>, from: String, to: String) =
     moveRuleSlots(original, { it.component }, { it.classificationKnown && !it.fixed && it.component !in hiddenComponents }, from, to)
 
-private fun applyOrder(original: List<Processor>, orderedComponents: List<String>): List<Processor> {
-    val ordinary = original.filterNot { it.fixed }
-    if (orderedComponents.isEmpty()) return ordinary
-    val recognized = ordinary.filter { it.classificationKnown }
-    val byComponent = recognized.associateBy { it.component }
-    val ordered = orderedComponents.distinct().mapNotNull(byComponent::get)
-    val known = orderedComponents.toSet()
-    val filling = (ordered + recognized.filterNot { it.component in known }).iterator()
-    return ordinary.map { if (it.classificationKnown) filling.next() else it }
-}
+internal fun applyOrder(original: List<Processor>, orderedComponents: List<String>): List<Processor> =
+    RuleConfig(emptySet(), orderedComponents).apply(original, { it.component }, { it.fixed || !it.classificationKnown })
 
-private fun mergeOrder(previous: List<String>, visible: List<String>, fixed: Set<String>): List<String> {
+internal fun mergeOrder(previous: List<String>, visible: List<String>, fixed: Set<String>): List<String> {
     val ordinaryVisible = visible.filterNot { it in fixed }.distinct()
     val ordinaryPrevious = previous.filterNot { it in fixed }.distinct()
     val visibleSet = ordinaryVisible.toSet()
