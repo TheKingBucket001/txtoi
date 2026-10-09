@@ -22,9 +22,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq .object.sha)
-          verified=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" --jq .verification.verified)
-          test "$verified" = true
+          tag_ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
+          test "$(jq -r .object.type <<< "$tag_ref")" = tag
+          tag_object=$(jq -r .object.sha <<< "$tag_ref")
+          tag_data=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}")
+          jq -e --arg sha "$GITHUB_SHA" '.verification.verified == true and .object.type == "commit" and .object.sha == $sha and (.verification.signature | startswith("-----BEGIN SSH SIGNATURE-----"))' <<< "$tag_data" >/dev/null
       - uses: actions/setup-java@v5
         with:
           distribution: zulu
@@ -54,9 +56,9 @@ jobs:
       - name: Build and lint
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            ./gradlew :app:assembleRelease :app:lintRelease :app:verifyModernXposedMetadata --no-daemon
+            ./gradlew :app:assembleRelease :app:lintRelease :app:testDebugUnitTest :app:verifyModernXposedMetadata :app:verifyReleaseModernXposedMetadata --no-daemon
           else
-            ./gradlew :app:assembleDebug :app:lintDebug :app:verifyModernXposedMetadata --no-daemon
+            ./gradlew :app:assembleDebug :app:lintDebug :app:testDebugUnitTest :app:verifyModernXposedMetadata --no-daemon
           fi
       - name: Name release APK
         if: startsWith(github.ref, 'refs/tags/v')
@@ -68,17 +70,6 @@ jobs:
           name: txtoi-release-${{ github.ref_name }}
           path: app/build/outputs/apk/release/txtoi-${{ github.ref_name }}.apk
           if-no-files-found: error
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ github.ref_name }}
-          files: app/build/outputs/apk/release/txtoi-${{ github.ref_name }}.apk
-          body: |
-            ## 改进
-
-            - 环境检测改为一次性 Global challenge-response，不再通过应用 Provider 回报状态。
-            - 文本菜单查询不再触碰应用进程，避免 Android 关联启动记录。
       - name: Prepare LSPosed mirror release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -88,9 +79,42 @@ jobs:
           version_name=$(jq -er '.elements[0].versionName' "$metadata")
           test "$version_code" -gt 0
           test -n "$version_name"
+          test "$GITHUB_REF_NAME" = "v$version_name"
           echo "LSPOSED_TAG=$version_code-$version_name" >> "$GITHUB_ENV"
           echo "LSPOSED_VERSION=$version_name" >> "$GITHUB_ENV"
           echo "LSPOSED_ASSET=app/build/outputs/apk/release/txtoi-${GITHUB_REF_NAME}.apk" >> "$GITHUB_ENV"
+      - name: Verify signed LSPosed mirror tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.XPOSED_REPO_TOKEN }}
+          MIRROR_REPOSITORY: Xposed-Modules-Repo/io.github.selectionmenucontrol
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?XPOSED_REPO_TOKEN is required for LSPosed release sync}"
+          tag_ref=$(gh api "repos/${MIRROR_REPOSITORY}/git/ref/tags/${LSPOSED_TAG}")
+          test "$(jq -r .object.type <<< "$tag_ref")" = tag
+          tag_object=$(jq -r .object.sha <<< "$tag_ref")
+          tag_data=$(gh api "repos/${MIRROR_REPOSITORY}/git/tags/${tag_object}")
+          jq -e --arg sha "$GITHUB_SHA" '.verification.verified == true and .object.type == "commit" and .object.sha == $sha and (.verification.signature | startswith("-----BEGIN SSH SIGNATURE-----"))' <<< "$tag_data" >/dev/null
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: app/build/outputs/apk/release/txtoi-${{ github.ref_name }}.apk
+          body: |
+            ## 改进
+
+            - 新增拖动排序，移动后自动保存，支持恢复默认排序。[#2](https://github.com/TheKingBucket001/txtoi/issues/2)
+            - 扩展项动态枚举，固定位置依据当前 ColorOS 菜单策略识别；仍只需 system 作用域。
+            - 固定项置顶，固定、隐藏和检测不可用的选项不能拖动。
+            - 列表与整卡拖动范围受限，标题和底部恢复按钮固定。
+            - 修复连续勾选失效、长按高亮残留及取消拖动误保存；保存成功后短暂提示“已保存”。
+            - 关于页支持小窗口滚动，无法打开网页时给出提示。
+
+            ## 使用范围
+
+            已在 ColorOS 16 / Android 16 验证。剪切、复制、粘贴、全选、分享等宿主内置动作不属于统一扩展清单；系统接口变化或应用自定义菜单仍可能需要适配。
       - name: Sync release to LSPosed
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -105,7 +129,7 @@ jobs:
             gh release edit "$LSPOSED_TAG" --repo "$MIRROR_REPOSITORY" --title "$LSPOSED_VERSION" --notes-file "$release_notes"
             gh release upload "$LSPOSED_TAG" "$LSPOSED_ASSET" --repo "$MIRROR_REPOSITORY" --clobber
           else
-            gh release create "$LSPOSED_TAG" "$LSPOSED_ASSET" --repo "$MIRROR_REPOSITORY" --title "$LSPOSED_VERSION" --notes-file "$release_notes"
+            gh release create "$LSPOSED_TAG" "$LSPOSED_ASSET" --verify-tag --repo "$MIRROR_REPOSITORY" --title "$LSPOSED_VERSION" --notes-file "$release_notes"
           fi
           asset_name=$(basename "$LSPOSED_ASSET")
           expected_digest="sha256:$(sha256sum "$LSPOSED_ASSET" | awk '{print $1}')"

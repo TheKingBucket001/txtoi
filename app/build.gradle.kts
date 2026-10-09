@@ -26,8 +26,8 @@ android {
         applicationId = "io.github.selectionmenucontrol"
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "0.5.0"
+        versionCode = 15
+        versionName = "0.6.0"
     }
 
     signingConfigs {
@@ -75,27 +75,30 @@ tasks.matching { it.name == "packageRelease" }.configureEach {
     }
 }
 
-tasks.register("verifyModernXposedMetadata") {
-    dependsOn("assembleDebug")
-    doLast {
-        val apk = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").get().asFile
-        ZipFile(apk).use { archive ->
-            val moduleProperties = archive.getEntry("META-INF/xposed/module.prop")
-                ?: error("Modern module.prop is missing from the APK")
-            val scope = archive.getEntry("META-INF/xposed/scope.list")
-                ?: error("Modern scope.list is missing from the APK")
-            val entryPoint = archive.getEntry("META-INF/xposed/java_init.list")
-                ?: error("Modern java_init.list is missing from the APK")
-            check(archive.getEntry("assets/xposed_init") == null) { "Legacy Xposed entry must not be packaged" }
-            check(archive.getInputStream(moduleProperties).bufferedReader().readText().contains("staticScope=true")) {
-                "Module must declare staticScope=true"
-            }
-            check(archive.getInputStream(scope).bufferedReader().readText().trim() == "system") {
-                "Static scope must only contain system"
-            }
-            check(archive.getInputStream(entryPoint).bufferedReader().readText().trim()
-                    == "io.github.selectionmenucontrol.SelectionMenuModule") {
-                "Modern module entry point is incorrect"
+for (variant in listOf("debug", "release")) {
+    val verificationTask = if (variant == "debug") "verifyModernXposedMetadata" else "verifyReleaseModernXposedMetadata"
+    tasks.register(verificationTask) {
+        dependsOn(if (variant == "debug") "assembleDebug" else "assembleRelease")
+        doLast {
+            val apk = layout.buildDirectory.file("outputs/apk/$variant/app-$variant.apk").get().asFile
+            ZipFile(apk).use { archive ->
+                val moduleProperties = archive.getEntry("META-INF/xposed/module.prop")
+                    ?: error("Modern module.prop is missing from the APK")
+                val scope = archive.getEntry("META-INF/xposed/scope.list")
+                    ?: error("Modern scope.list is missing from the APK")
+                val entryPoint = archive.getEntry("META-INF/xposed/java_init.list")
+                    ?: error("Modern java_init.list is missing from the APK")
+                check(archive.getEntry("assets/xposed_init") == null) { "Legacy Xposed entry must not be packaged" }
+                check(archive.getInputStream(moduleProperties).bufferedReader().readText().contains("staticScope=true")) {
+                    "Module must declare staticScope=true"
+                }
+                check(archive.getInputStream(scope).bufferedReader().readText().trim() == "system") {
+                    "Static scope must only contain system"
+                }
+                check(archive.getInputStream(entryPoint).bufferedReader().readText().trim()
+                        == "io.github.selectionmenucontrol.SelectionMenuModule") {
+                    "Modern module entry point is incorrect"
+                }
             }
         }
     }
@@ -106,4 +109,5 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.12.4")
     implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.3")
     implementation("top.yukonga.miuix.kmp:miuix-preference:0.9.3")
+    testImplementation("junit:junit:4.13.2")
 }

@@ -8,7 +8,7 @@
 2. 在项目根目录执行以下命令，确认能构建、通过代码规范检查：
 
    ```powershell
-   .\gradlew.bat :app:assembleDebug :app:lintDebug --no-daemon
+   .\gradlew.bat :app:assembleDebug :app:lintDebug :app:testDebugUnitTest :app:verifyModernXposedMetadata --no-daemon
    ```
 
 3. 如果命令失败，请在提交说明中附上完整错误信息和使用的 JDK、Android SDK 版本。
@@ -27,3 +27,9 @@
 ## 提交内容
 
 不要提交密钥、签名文件、未脱敏的设备日志或本地构建产物。提交前请检查 `git diff`，确保改动和提交说明一致。
+
+## 发布检查
+
+正式版必须通过 GitHub Actions 构建、Release Lint、单元测试及正式 APK 的 Modern Xposed 元数据检查。主仓 `v版本号` 和镜像 `版本代码-版本号` Tag 都必须提前以 SSH `git tag -s` 创建，推送后确认 GitHub `verification.verified=true`。新镜像 Tag 应指向与主仓相同的源代码提交。
+
+CI 会在发布前核对两边 Tag 的 SSH 签名及目标提交，并核对镜像 APK 摘要；Tag 缺失或验证失败时停止发布，不允许由 Release 自动创建未签名 Tag。

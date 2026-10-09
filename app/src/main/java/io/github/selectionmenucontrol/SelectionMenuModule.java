@@ -4,13 +4,18 @@ import android.annotation.SuppressLint;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.ResolveInfo;
+import android.os.Binder;
+import android.os.Bundle;
 import android.os.SystemClock;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
+import java.util.IdentityHashMap;
+import java.util.Map;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -23,6 +28,10 @@ public final class SelectionMenuModule extends XposedModule {
     private static volatile long nextRefreshAt;
     private static volatile Context systemContext;
     private static volatile String lastRespondedProbeNonce;
+    private static volatile int moduleAppId = -1;
+    private static SystemMenuClassifier menuClassifier;
+    private static long nextClassifierAttemptAt;
+    private static boolean reportedClassifierInitializationFailure;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -34,58 +43,18 @@ public final class SelectionMenuModule extends XposedModule {
     @Override
     public void onSystemServerStarting(XposedModuleInterface.SystemServerStartingParam param) {
         try {
-            Class<?> computerEngine = Class.forName(
-                    "com.android.server.pm.ComputerEngine", false, param.getClassLoader());
-            Method target = computerEngine.getDeclaredMethod(
-                    "queryIntentActivitiesInternal",
-                    Intent.class,
-                    String.class,
-                    long.class,
-                    long.class,
-                    int.class,
-                    int.class,
-                    int.class,
-                    boolean.class,
-                    boolean.class);
-            hook(target).intercept(this::interceptProcessTextQuery);
-            log(android.util.Log.INFO, "SelectionMenuControl", "Hooked ComputerEngine 9-argument queryIntentActivitiesInternal");
+            ClassLoader classLoader = param.getClassLoader();
+            Class<?> packageManager = Class.forName(
+                    "com.android.server.pm.IPackageManagerBase", false, classLoader);
+            Method query = packageManager.getDeclaredMethod("queryIntentActivities",
+                    Intent.class, String.class, long.class, int.class);
+            Class<?> sliceClass = Class.forName("android.content.pm.ParceledListSlice", false, classLoader);
+            Method getList = sliceClass.getMethod("getList");
+            Constructor<?> newSlice = sliceClass.getConstructor(List.class);
+            hook(query).intercept(chain -> interceptPublicProcessTextQuery(chain, sliceClass, getList, newSlice));
+            log(android.util.Log.INFO, "SelectionMenuControl", "Hooked public PROCESS_TEXT queryIntentActivities boundary");
         } catch (Throwable error) {
-            log(android.util.Log.ERROR, "SelectionMenuControl", "ComputerEngine hook not installed", error);
-        }
-    }
-
-    private Object interceptProcessTextQuery(XposedInterface.Chain chain) throws Throwable {
-        Intent intent = findIntentArgument(chain.getArgs());
-        boolean processText = intent != null && Intent.ACTION_PROCESS_TEXT.equals(intent.getAction());
-        if (processText) {
-            respondToProbe();
-        }
-        Object result = chain.proceed();
-        if (!(result instanceof List<?>)) {
-            return result;
-        }
-        if (!processText) {
-            return result;
-        }
-        SystemRuleStore.Snapshot rules = readRules();
-        if (rules.hiddenComponents.isEmpty()) {
-            return result;
-        }
-        try {
-            List<?> original = (List<?>) result;
-            List<ResolveInfo> filtered = new ArrayList<>(original.size());
-            for (Object entry : original) {
-                if (!(entry instanceof ResolveInfo)) {
-                    return result;
-                }
-                ResolveInfo info = (ResolveInfo) entry;
-                if (!isHidden(info, rules.hiddenComponents)) {
-                    filtered.add(info);
-                }
-            }
-            return filtered.size() == original.size() ? result : filtered;
-        } catch (Throwable ignored) {
-            return result;
+            log(android.util.Log.ERROR, "SelectionMenuControl", "Public PROCESS_TEXT menu query hook not installed", error);
         }
     }
 
@@ -98,9 +67,125 @@ public final class SelectionMenuModule extends XposedModule {
         return null;
     }
 
-    private static boolean isHidden(ResolveInfo info, Set<String> hiddenComponents) {
-        return info.activityInfo != null && hiddenComponents.contains(
-                new ComponentName(info.activityInfo.packageName, info.activityInfo.name).flattenToString());
+    private static String componentOf(ResolveInfo info) {
+        return info.activityInfo == null ? "" : new ComponentName(
+                info.activityInfo.packageName, info.activityInfo.name).flattenToString();
+    }
+
+    private Object interceptPublicProcessTextQuery(XposedInterface.Chain chain, Class<?> sliceClass,
+                                                   Method getList, Constructor<?> newSlice) throws Throwable {
+        Intent intent = findIntentArgument(chain.getArgs());
+        boolean processText = intent != null && Intent.ACTION_PROCESS_TEXT.equals(intent.getAction());
+        Object result = chain.proceed();
+        if (!processText || !sliceClass.isInstance(result)) {
+            return result;
+        }
+        boolean originalQuery = isOriginalQuery(intent);
+        SystemRuleStore.Snapshot rules = readRules();
+        if (!originalQuery && (!rules.valid || (rules.hiddenComponents.isEmpty() && rules.orderedComponents.isEmpty()))) {
+            respondToProbe();
+            return result;
+        }
+        try {
+            Object contents = getList.invoke(result);
+            if (!(contents instanceof List<?>)) {
+                return result;
+            }
+            List<?> original = (List<?>) contents;
+            List<ResolveInfo> resolved = new ArrayList<>(original.size());
+            for (Object entry : original) {
+                if (!(entry instanceof ResolveInfo)) {
+                    return result;
+                }
+                resolved.add((ResolveInfo) entry);
+            }
+            Map<ResolveInfo, Integer> classifications = new IdentityHashMap<>();
+            if (originalQuery || !rules.orderedComponents.isEmpty()) {
+                long identity = Binder.clearCallingIdentity();
+                try {
+                    Context context = getSystemContext();
+                    SystemMenuClassifier classifier = getMenuClassifier();
+                    for (int index = 0; index < resolved.size(); index++) {
+                        ResolveInfo entry = resolved.get(index);
+                        classifications.put(entry, classifier == null ? SystemMenuClassifier.UNKNOWN
+                                : classifier.classify(context, entry, index));
+                    }
+                } finally {
+                    Binder.restoreCallingIdentity(identity);
+                }
+            }
+            if (originalQuery) {
+                List<ResolveInfo> annotated = new ArrayList<>(resolved.size());
+                for (ResolveInfo entry : resolved) {
+                    ResolveInfo copy = new ResolveInfo(entry);
+                    if (entry.activityInfo != null) {
+                        copy.activityInfo = new ActivityInfo(entry.activityInfo);
+                        copy.activityInfo.metaData = entry.activityInfo.metaData == null ? new Bundle()
+                                : new Bundle(entry.activityInfo.metaData);
+                        copy.activityInfo.metaData.putInt(SystemRuleStore.MENU_CLASSIFICATION_KEY,
+                                classifications.getOrDefault(entry, SystemMenuClassifier.UNKNOWN));
+                    }
+                    annotated.add(copy);
+                }
+                Object annotatedResult = newSlice.newInstance(annotated);
+                respondToProbe();
+                return annotatedResult;
+            }
+            List<ResolveInfo> filtered = rules.apply(resolved, SelectionMenuModule::componentOf,
+                    entry -> classifications.getOrDefault(entry, SystemMenuClassifier.UNKNOWN) != SystemMenuClassifier.ORDINARY);
+            // Keep the original slice and ResolveInfo objects untouched. No internal resolution
+            // query is filtered or reordered, including resolveActivity with resolveForStart=false.
+            Object effectiveResult = filtered.equals(original) ? result : newSlice.newInstance(filtered);
+            // Respond only after the original query and any required result replacement succeed.
+            respondToProbe();
+            return effectiveResult;
+        } catch (Throwable error) {
+            log(android.util.Log.WARN, "SelectionMenuControl", "Public query menu rules failed; original list preserved", error);
+            return result;
+        }
+    }
+
+    private static synchronized SystemMenuClassifier getMenuClassifier() {
+        if (menuClassifier == null && SystemClock.elapsedRealtime() >= nextClassifierAttemptAt) {
+            nextClassifierAttemptAt = SystemClock.elapsedRealtime() + 5_000L;
+            try {
+                menuClassifier = new SystemMenuClassifier();
+                android.util.Log.i("SelectionMenuControl", "Installed ROM menu policy classifier ready");
+            } catch (Throwable error) {
+                if (!reportedClassifierInitializationFailure) {
+                    reportedClassifierInitializationFailure = true;
+                    android.util.Log.w("SelectionMenuControl", "Installed ROM menu policy unavailable; hiding remains active, will retry", error);
+                }
+            }
+        }
+        return menuClassifier;
+    }
+
+    private static boolean isOriginalQuery(Intent intent) {
+        try {
+            if (!intent.getBooleanExtra(SystemRuleStore.QUERY_ORIGINAL_EXTRA, false)) {
+                return false;
+            }
+            int callingAppId = Binder.getCallingUid() % 100_000;
+            int appId = moduleAppId;
+            if (appId < 0) {
+                Context context = getSystemContext();
+                if (context == null) {
+                    return false;
+                }
+                long identity = Binder.clearCallingIdentity();
+                try {
+                    appId = context.getPackageManager().getPackageUid(BuildConfig.APPLICATION_ID, 0) % 100_000;
+                    moduleAppId = appId;
+                } finally {
+                    Binder.restoreCallingIdentity(identity);
+                }
+            }
+            // Only the module UI may enumerate the original list, including hidden activities.
+            return callingAppId == appId;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static SystemRuleStore.Snapshot readRules() {
@@ -124,11 +209,13 @@ public final class SelectionMenuModule extends XposedModule {
     }
 
     private void respondToProbe() {
-        Context context = getSystemContext();
-        if (context != null) {
-            String nonce = SystemRuleStore.respondToProbe(context, lastRespondedProbeNonce);
-            if (nonce != null) {
-                lastRespondedProbeNonce = nonce;
+        synchronized (SelectionMenuModule.class) {
+            Context context = getSystemContext();
+            if (context != null) {
+                String nonce = SystemRuleStore.respondToProbe(context, lastRespondedProbeNonce);
+                if (nonce != null) {
+                    lastRespondedProbeNonce = nonce;
+                }
             }
         }
     }

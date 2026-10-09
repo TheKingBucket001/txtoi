@@ -1,11 +1,9 @@
 package io.github.selectionmenucontrol
 
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ActivityInfo
+import android.content.ActivityNotFoundException
 import android.content.pm.PackageManager
-import android.content.pm.ResolveInfo
 import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -19,6 +17,9 @@ import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,7 +35,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -53,24 +53,24 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.animation.core.tween
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
-import top.yukonga.miuix.kmp.preference.CheckboxLocation
-import top.yukonga.miuix.kmp.preference.CheckboxPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 import top.yukonga.miuix.kmp.window.WindowDialog
-import java.util.Collections
-import java.util.Comparator
-import java.util.HashSet
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -92,8 +92,6 @@ private data class GateState(
     val rootReady: Boolean = false,
     val rootMessage: String = "等待系统框架检测完成",
 )
-
-private data class Processor(val component: String, val label: String, val summary: String)
 
 private data class UpdateInfo(
     val version: String,
@@ -161,22 +159,21 @@ private fun ModuleApp(activity: MainActivity) {
     }
 
     LaunchedEffect(refreshSignal) {
-        Thread {
-            val hook = waitForSystemHook(activity)
-            val root = if (hook.loadedForCurrentBoot) RootAccess.check() else null
-            activity.runOnUiThread {
-                gateState = GateState(
+        gateState = GateState(checking = true, rootMessage = "正在验证 Root 授权")
+        gateState = withContext(Dispatchers.IO) {
+            environmentCheckMutex.withLock {
+                ensureActive()
+                val root = RootAccess.check()
+                ensureActive()
+                val hook = if (root.granted) waitForSystemHook(activity) else SystemRuleStore.HookStatus.unavailable()
+                GateState(
                     checking = false,
                     systemHookReady = hook.loadedForCurrentBoot,
-                    rootReady = root?.granted == true,
-                    rootMessage = when {
-                        root == null -> "等待系统框架就绪后再验证"
-                        root.granted -> "已获得 uid=0"
-                        else -> root.message
-                    },
+                    rootReady = root.granted,
+                    rootMessage = root.message,
                 )
             }
-        }.start()
+        }
     }
 
     if (gateState.checking || !gateState.systemHookReady || !gateState.rootReady) {
@@ -210,13 +207,19 @@ private fun ModuleApp(activity: MainActivity) {
             update = update,
             onDismiss = { availableUpdate = null },
             onOpenRelease = {
-                try {
-                    activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(update.releaseUrl)))
-                } catch (_: Throwable) {
-                    Toast.makeText(activity, "无法打开更新页面", Toast.LENGTH_SHORT).show()
-                }
+                openWebPage(activity, update.releaseUrl, "无法打开更新页面")
             },
         )
+    }
+}
+
+private fun openWebPage(activity: MainActivity, url: String, failureMessage: String) {
+    try {
+        activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+    } catch (_: ActivityNotFoundException) {
+        Toast.makeText(activity, failureMessage, Toast.LENGTH_SHORT).show()
+    } catch (_: SecurityException) {
+        Toast.makeText(activity, failureMessage, Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -348,30 +351,30 @@ private const val UPDATE_RETRY_DELAY_MS = 1_500L
 private const val UPDATE_CACHE_VALIDITY_MS = 60L * 60L * 1_000L
 private const val UPDATE_LOG_TAG = "SelectionMenuControl"
 
-private fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.HookStatus {
-    val request = SystemRuleStore.beginProbe(activity) ?: return SystemRuleStore.HookStatus.unavailable()
-    val deadline = System.currentTimeMillis() + 2_000L
+private val environmentCheckMutex = Mutex()
+
+private suspend fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.HookStatus {
+    val request = SystemRuleStore.beginProbe() ?: return SystemRuleStore.HookStatus.unavailable()
+    val deadline = android.os.SystemClock.elapsedRealtime() + 2_000L
     try {
         do {
+            currentCoroutineContext().ensureActive()
             activity.packageManager.queryIntentActivities(
                 Intent(Intent.ACTION_PROCESS_TEXT).setType("text/plain"),
                 PackageManager.MATCH_ALL,
             )
-            Thread.sleep(100)
+            delay(100)
             val status = SystemRuleStore.readProbeResponse(activity, request)
-            if (status.loadedForCurrentBoot) {
-                SystemRuleStore.cancelProbe(request)
-                return status
-            }
-        } while (System.currentTimeMillis() < deadline)
-    } catch (_: Throwable) {
-        // The final probe read keeps the page locked if PackageManager cannot be queried.
-    }
-    val status = SystemRuleStore.readProbeResponse(activity, request)
-    if (!status.loadedForCurrentBoot) {
+            if (status.loadedForCurrentBoot) return status
+        } while (android.os.SystemClock.elapsedRealtime() < deadline)
+        return SystemRuleStore.readProbeResponse(activity, request)
+    } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        Log.w("SelectionMenuControl", "System hook probe failed", error)
+        return SystemRuleStore.readProbeResponse(activity, request)
+    } finally {
         SystemRuleStore.cancelProbe(request)
     }
-    return status
 }
 
 @Composable
@@ -411,7 +414,11 @@ private fun EnvironmentGate(state: GateState, onRefresh: () -> Unit) {
                 GateRow(
                     title = "系统框架作用域",
                     passed = state.systemHookReady,
-                    summary = if (state.systemHookReady) "已在本次启动中加载" else "请在 LSPosed 中固定系统框架作用域，然后重启设备。",
+                    summary = when {
+                        state.systemHookReady -> "已在本次启动中加载"
+                        !state.rootReady -> "完成 Root 授权后，即可检查系统框架。"
+                        else -> "请在 LSPosed 中勾选系统框架，然后热重启设备。"
+                    },
                 )
                 AboutInfoDivider()
                 GateRow(
@@ -471,148 +478,6 @@ private fun GateRow(title: String, passed: Boolean, summary: String) {
 }
 
 @Composable
-private fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
-    var snapshot by remember { mutableStateOf(SystemRuleStore.readApp(activity)) }
-    var processors by remember { mutableStateOf<List<Processor>?>(null) }
-    var saving by remember { mutableStateOf(false) }
-    var showRestoreConfirm by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        val migrated = withContext(Dispatchers.IO) {
-            SystemRuleStore.migrateToGlobal(activity, snapshot.hiddenComponents)
-        }
-        if (!migrated) {
-            Toast.makeText(activity, "规则迁移失败，请确认 Root 授权", Toast.LENGTH_LONG).show()
-        }
-        processors = withContext(Dispatchers.IO) { loadProcessors(activity, snapshot.hiddenComponents) }
-    }
-
-    fun save(nextHidden: Set<String>) {
-        saving = true
-        Thread {
-            val saved = SystemRuleStore.save(activity, nextHidden)
-            activity.runOnUiThread {
-                saving = false
-                if (saved) {
-                    snapshot = SystemRuleStore.Snapshot(nextHidden)
-                    Toast.makeText(activity, "隐藏规则已保存", Toast.LENGTH_SHORT).show()
-                } else {
-                    snapshot = SystemRuleStore.readApp(activity)
-                    Toast.makeText(activity, "规则保存失败", Toast.LENGTH_LONG).show()
-                }
-            }
-        }.start()
-    }
-
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MiuixTheme.colorScheme.background)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
-        contentPadding = PaddingValues(bottom = 12.dp),
-    ) {
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp, top = 10.dp, bottom = 0.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "文本选择菜单",
-                    fontSize = 28.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.weight(1f),
-                )
-                IconButton(onClick = onAbout, enabled = !saving) {
-                    Image(
-                        painter = painterResource(R.drawable.ic_info),
-                        contentDescription = "关于",
-                        modifier = Modifier.size(25.dp),
-                    )
-                }
-            }
-        }
-        item {
-            Column(modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 8.dp, bottom = 0.dp)) {
-                Text("文字处理扩展项", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold)
-                Text(
-                    "勾选的项目会从所有应用的文本选择菜单中隐藏。",
-                    modifier = Modifier.padding(top = 2.dp),
-                    style = MiuixTheme.textStyles.body2,
-                    color = MiuixTheme.colorScheme.onBackgroundVariant,
-                )
-            }
-        }
-        item {
-            Card(modifier = Modifier.padding(horizontal = 12.dp, vertical = 0.dp)) {
-                if (processors == null) {
-                    Text("正在读取系统扩展项…", modifier = Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2)
-                } else if (processors!!.isEmpty()) {
-                    Text("当前没有可配置的文字处理扩展项", modifier = Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2)
-                }
-            }
-        }
-        items(processors ?: emptyList(), key = { it.component }) { processor ->
-            Card(modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp)) {
-                CheckboxPreference(
-                    title = processor.label,
-                    summary = processor.summary,
-                    checked = snapshot.hiddenComponents.contains(processor.component),
-                    enabled = !saving,
-                    checkboxLocation = CheckboxLocation.End,
-                    onCheckedChange = { checked ->
-                        val next = HashSet(snapshot.hiddenComponents)
-                        if (checked) next.add(processor.component) else next.remove(processor.component)
-                        save(next)
-                    },
-                )
-            }
-        }
-        item {
-            TextButton(
-                text = "恢复全部显示",
-                onClick = { showRestoreConfirm = true },
-                enabled = snapshot.hiddenComponents.isNotEmpty() && !saving,
-                modifier = Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, top = 6.dp, bottom = 4.dp),
-                colors = ButtonDefaults.textButtonColors(
-                    textColor = Color(0xFFD14343),
-                    disabledTextColor = Color(0xFFD14343).copy(alpha = 0.4f),
-                ),
-            )
-        }
-    }
-
-    if (showRestoreConfirm) {
-        WindowDialog(
-            show = true,
-            onDismissRequest = { showRestoreConfirm = false },
-            content = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("恢复全部显示", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                    Text("将清除已隐藏的扩展项，所有 PROCESS_TEXT 菜单会恢复显示。", fontSize = 14.sp, lineHeight = 20.sp)
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        TextButton(
-                            text = "取消",
-                            onClick = { showRestoreConfirm = false },
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(
-                            text = "确认恢复",
-                            onClick = {
-                                showRestoreConfirm = false
-                                save(emptySet())
-                            },
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.textButtonColorsPrimary(),
-                        )
-                    }
-                }
-            },
-        )
-    }
-}
-
-@Composable
 @Suppress("UseKtx")
 private fun AboutScreen(
     activity: MainActivity,
@@ -620,6 +485,8 @@ private fun AboutScreen(
     autoCheckEnabled: Boolean,
     onAutoCheckChange: (Boolean) -> Unit,
 ) {
+    var showDailyMenu by remember { mutableStateOf(false) }
+    BackHandler(enabled = showDailyMenu) { showDailyMenu = false }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -648,48 +515,75 @@ private fun AboutScreen(
             Spacer(Modifier.width(48.dp))
         }
 
-        Card(
-            modifier = Modifier
-                .padding(horizontal = 16.dp, vertical = 6.dp)
-                .clip(RoundedCornerShape(24.dp)),
-        ) {
-            Column(
-                modifier = Modifier.fillMaxWidth().background(Color(0xFFF0F6FF)).padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+        Column(modifier = Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+            Card(
+                modifier = Modifier
+                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                    .clip(RoundedCornerShape(24.dp)),
             ) {
-                Image(painter = painterResource(R.drawable.ic_module), contentDescription = null, modifier = Modifier.size(56.dp))
-                Text("系统文本菜单", color = Color(0xFF1976D2), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                Text("文本菜单控制", fontWeight = FontWeight.Bold, fontSize = 26.sp, color = Color(0xFF171717))
-                Text("管理全系统文本选择菜单中的 PROCESS_TEXT 扩展项。", color = Color(0xFF5E6570), fontSize = 14.sp, lineHeight = 20.sp)
+                Column(
+                    modifier = Modifier.fillMaxWidth().background(Color(0xFFF0F6FF)).padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Image(
+                        painter = painterResource(R.drawable.ic_module),
+                        contentDescription = "文本菜单控制图标",
+                        modifier = Modifier.size(56.dp).combinedClickable(
+                            onClick = {},
+                            onLongClickLabel = "打开今日菜单",
+                            onLongClick = { showDailyMenu = true },
+                        ),
+                    )
+                    Text("系统文本菜单", color = Color(0xFF1976D2), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text("文本菜单控制", fontWeight = FontWeight.Bold, fontSize = 26.sp, color = Color(0xFF171717))
+                    Text("管理全系统文本选择菜单中的 PROCESS_TEXT 扩展项。", color = Color(0xFF5E6570), fontSize = 14.sp, lineHeight = 20.sp)
+                }
+            }
+
+            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                AboutInfoRow("当前版本", BuildConfig.VERSION_NAME)
+                AboutInfoDivider()
+                AboutInfoRow("模块 ID", "txtoi")
+                AboutInfoDivider()
+                AboutInfoRow("维护者", "Bucket")
+            }
+
+            Text("项目", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 8.dp, bottom = 2.dp))
+            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                AboutActionRow("查看源代码", "GitHub · TheKingBucket001/txtoi", "GitHub") {
+                    openWebPage(activity, "https://github.com/TheKingBucket001/txtoi", "无法打开源代码页面")
+                }
+                AboutInfoDivider()
+                AboutActionRow("开源许可证", "GNU General Public License v3.0", "GPL-3.0", null)
+            }
+
+            Text("更新", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 8.dp, bottom = 2.dp))
+            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                SwitchPreference(
+                    checked = autoCheckEnabled,
+                    onCheckedChange = onAutoCheckChange,
+                    title = "自动检测更新",
+                    summary = "打开模块时检测新版本",
+                )
             }
         }
-
-        Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-            AboutInfoRow("当前版本", BuildConfig.VERSION_NAME)
-            AboutInfoDivider()
-            AboutInfoRow("模块 ID", "txtoi")
-            AboutInfoDivider()
-            AboutInfoRow("维护者", "Bucket")
-        }
-
-        Text("项目", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 8.dp, bottom = 2.dp))
-        Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-            AboutActionRow("查看源代码", "GitHub · TheKingBucket001/txtoi", "GitHub") {
-                activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/TheKingBucket001/txtoi")))
-            }
-            AboutInfoDivider()
-            AboutActionRow("开源许可证", "GNU General Public License v3.0", "GPL-3.0", null)
-        }
-
-        Text("更新", style = MiuixTheme.textStyles.subtitle, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 24.dp, top = 8.dp, bottom = 2.dp))
-        Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-            SwitchPreference(
-                checked = autoCheckEnabled,
-                onCheckedChange = onAutoCheckChange,
-                title = "自动检测更新",
-                summary = "打开模块时检测新版本",
-            )
-        }
+    }
+    if (showDailyMenu) {
+        WindowDialog(
+            show = true,
+            onDismissRequest = { showDailyMenu = false },
+            content = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("今日菜单", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Text("复制一点快乐\n粘贴一点好运\n把烦恼留在菜单外", fontSize = 16.sp, lineHeight = 28.sp)
+                    TextButton(
+                        text = "收下好运",
+                        onClick = { showDailyMenu = false },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+        )
     }
 }
 
@@ -716,34 +610,4 @@ private fun AboutActionRow(title: String, summary: String, action: String, onCli
         }
         Text(action, color = Color(0xFF1976D2), fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 12.dp))
     }
-}
-
-private fun loadProcessors(activity: ComponentActivity, hiddenComponents: Set<String>): List<Processor> {
-    val intent = Intent(Intent.ACTION_PROCESS_TEXT).setType("text/plain")
-    val packageManager = activity.packageManager
-    val infos: List<ResolveInfo> = packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
-    val processors = ArrayList<Processor>()
-    val knownComponents = HashSet<String>()
-    for (info in infos) {
-        val activityInfo: ActivityInfo = info.activityInfo ?: continue
-        val component = ComponentName(activityInfo.packageName, activityInfo.name)
-        val label = info.loadLabel(activity.packageManager).toString().ifBlank { component.shortClassName }
-        processors.add(Processor(component.flattenToString(), label, activityInfo.packageName))
-        knownComponents.add(component.flattenToString())
-    }
-    // The system_server hook hides selected entries from queryIntentActivities. Read their
-    // metadata directly so an upgrade or restart cannot make persisted rules disappear.
-    for (flattened in hiddenComponents) {
-        if (knownComponents.contains(flattened)) continue
-        val component = ComponentName.unflattenFromString(flattened) ?: continue
-        val activityInfo = try {
-            packageManager.getActivityInfo(component, PackageManager.MATCH_ALL)
-        } catch (_: Throwable) {
-            null
-        } ?: continue
-        val label = activityInfo.loadLabel(packageManager).toString().ifBlank { component.shortClassName }
-        processors.add(Processor(component.flattenToString(), label, activityInfo.packageName))
-    }
-    Collections.sort(processors, Comparator.comparing { it.label.lowercase() })
-    return processors
 }

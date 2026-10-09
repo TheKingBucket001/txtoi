@@ -40,39 +40,41 @@ final class RootAccess {
     }
 
     static boolean putGlobalSetting(String key, String value) {
+        return putGlobalSetting(key, value, false);
+    }
+
+    static boolean putGlobalSettingVerified(String key, String value) {
+        return putGlobalSetting(key, value, true);
+    }
+
+    private static boolean putGlobalSetting(String key, String value, boolean verify) {
         if (key == null || !key.matches("[a-z0-9_]+")
                 || value == null || !value.matches("[A-Za-z0-9_:+/=]+")) {
             return false;
         }
-        String command = "/system/bin/settings put global " + key + " " + value;
-        for (String suCommand : SU_COMMANDS) {
-            try {
-                Process process = start(suCommand, command);
-                try {
-                    if (!process.waitFor(3, TimeUnit.SECONDS)) {
-                        return false;
-                    }
-                    return process.exitValue() == 0;
-                } finally {
-                    closeProcess(process);
-                }
-            } catch (IOException error) {
-                if (!isMissingExecutable(suCommand)) {
-                    return false;
-                }
-            } catch (InterruptedException error) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
+        String command = "/system/bin/settings put global " + key + " '" + value + "'";
+        if (verify) {
+            command += " && [ \"$(/system/bin/settings get global " + key + ")\" = '" + value + "' ]";
         }
-        return false;
+        return execute(command);
     }
 
     static boolean deleteGlobalSetting(String key) {
         if (key == null || !key.matches("[a-z0-9_]+")) {
             return false;
         }
-        String command = "/system/bin/settings delete global " + key;
+        return execute("/system/bin/settings delete global " + key);
+    }
+
+    static void deleteGlobalSettingWithPrefix(String key, String prefix) {
+        if (key != null && key.matches("[a-z0-9_]+")
+                && prefix != null && prefix.matches("[A-Za-z0-9_:+/=]+")) {
+            execute("case \"$(/system/bin/settings get global " + key + ")\" in '"
+                    + prefix + "'*) /system/bin/settings delete global " + key + ";; esac");
+        }
+    }
+
+    private static boolean execute(String command) {
         for (String suCommand : SU_COMMANDS) {
             try {
                 Process process = start(suCommand, command);

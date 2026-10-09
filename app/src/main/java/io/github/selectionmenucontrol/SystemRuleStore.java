@@ -4,12 +4,8 @@ import android.content.Context;
 import android.os.Binder;
 import android.provider.Settings;
 import android.util.Log;
-import android.util.Base64;
-
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
@@ -19,7 +15,8 @@ final class SystemRuleStore {
     static final String PROBE_REQUEST_KEY = "selection_menu_control_probe_request_v1";
     static final String PROBE_RESPONSE_KEY = "selection_menu_control_probe_response_v1";
     static final String PREFERENCES_NAME = "selection_menu_control_rules";
-    private static final String FORMAT_PREFIX = "v2:";
+    static final String QUERY_ORIGINAL_EXTRA = "io.github.selectionmenucontrol.QUERY_ORIGINAL";
+    static final String MENU_CLASSIFICATION_KEY = "io.github.selectionmenucontrol.MENU_CLASSIFICATION";
     private static final String PROBE_PREFIX = "v1:";
     private static final String PROBE_PENDING_RESPONSE = "v1:pending:0:0:0";
     private static final long PROBE_VALIDITY_MS = 5_000L;
@@ -29,20 +26,25 @@ final class SystemRuleStore {
 
     static Snapshot read(Context context) {
         String globalRules = readGlobalRules(context);
-        return globalRules == null ? Snapshot.empty() : decode(globalRules);
+        return decode(globalRules);
     }
 
     static Snapshot readApp(Context context) {
-        String globalRules = readGlobalRules(context);
-        if (globalRules != null) {
-            return decode(globalRules);
+        try {
+            String globalRules = Settings.Global.getString(context.getContentResolver(), SETTING_KEY);
+            if (globalRules != null) {
+                return decode(globalRules);
+            }
+            String legacyRules = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+                    .getString(SETTING_KEY, null);
+            return decode(legacyRules);
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to read app rules", error);
+            return new Snapshot(Collections.emptySet(), Collections.emptyList(), false);
         }
-        String legacyRules = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
-                .getString(SETTING_KEY, null);
-        return legacyRules == null ? Snapshot.empty() : decode(legacyRules);
     }
 
-    static ProbeRequest beginProbe(Context context) {
+    static ProbeRequest beginProbe() {
         String nonce = UUID.randomUUID().toString().replace("-", "");
         long issuedAt = System.currentTimeMillis();
         String request = PROBE_PREFIX + nonce + ":" + issuedAt;
@@ -84,7 +86,7 @@ final class SystemRuleStore {
                     && loadedAt >= request.issuedAt
                     && loadedAt <= now + 1_000L
                     && now - loadedAt <= PROBE_VALIDITY_MS;
-            return new HookStatus(valid, loadedAt);
+            return new HookStatus(valid);
         } catch (Throwable ignored) {
             return HookStatus.unavailable();
         }
@@ -92,7 +94,9 @@ final class SystemRuleStore {
 
     static void cancelProbe(ProbeRequest request) {
         if (request != null) {
-            RootAccess.deleteGlobalSetting(PROBE_REQUEST_KEY);
+            String prefix = PROBE_PREFIX + request.nonce + ":";
+            RootAccess.deleteGlobalSettingWithPrefix(PROBE_REQUEST_KEY, prefix);
+            RootAccess.deleteGlobalSettingWithPrefix(PROBE_RESPONSE_KEY, prefix);
         }
     }
 
@@ -104,20 +108,35 @@ final class SystemRuleStore {
         }
     }
 
-    static boolean save(Context context, Set<String> hiddenComponents) {
-        String encoded = encode(hiddenComponents);
-        if (!RootAccess.putGlobalSetting(SETTING_KEY, encoded)) {
+    static synchronized boolean save(Context context, Snapshot snapshot) {
+        if (!snapshot.valid) {
             return false;
         }
-        context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+        String encoded = snapshot.encode();
+        if (!RootAccess.putGlobalSettingVerified(SETTING_KEY, encoded)) {
+            return false;
+        }
+        if (!context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putString(SETTING_KEY, encoded)
-                .commit();
+                .commit()) {
+            Log.w(TAG, "Global rules saved; private backup could not be updated");
+        }
         return true;
     }
 
-    static boolean migrateToGlobal(Context context, Set<String> hiddenComponents) {
-        return RootAccess.putGlobalSetting(SETTING_KEY, encode(hiddenComponents));
+    static synchronized boolean migrateToGlobal(Context context, Snapshot snapshot) {
+        // Existing Global rules are authoritative. Opening the page must not overwrite them.
+        try {
+            String current = Settings.Global.getString(context.getContentResolver(), SETTING_KEY);
+            if (current != null) {
+                return decode(current).valid;
+            }
+            return snapshot.valid && save(context, snapshot);
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to migrate rules", error);
+            return false;
+        }
     }
 
     private static String readGlobalRules(Context context) {
@@ -190,48 +209,28 @@ final class SystemRuleStore {
     }
 
     static Snapshot decode(String value) {
-        if (value == null) {
-            return Snapshot.empty();
-        }
         try {
-            String encoded;
-            if (value.startsWith(FORMAT_PREFIX)) {
-                encoded = value.substring(FORMAT_PREFIX.length());
-            } else if (value.startsWith("v1:")) {
-                // Read the previous format once so removing the switch does not erase user rules.
-                String[] parts = value.split(":", 3);
-                if (parts.length != 3) {
-                    return Snapshot.empty();
-                }
-                encoded = parts[2];
-            } else {
-                return Snapshot.empty();
-            }
-            String decoded = new String(Base64.decode(encoded, Base64.NO_WRAP), StandardCharsets.UTF_8);
-            Set<String> hidden = new HashSet<>();
-            if (!decoded.isEmpty()) {
-                Collections.addAll(hidden, decoded.split("\\n"));
-                hidden.remove("");
-            }
-            return new Snapshot(hidden);
+            RuleConfig decoded = RuleConfig.decode(value);
+            return new Snapshot(decoded.hiddenComponents, decoded.orderedComponents);
         } catch (IllegalArgumentException ignored) {
-            return Snapshot.empty();
+            return new Snapshot(Collections.emptySet(), Collections.emptyList(), false);
         }
     }
 
-    static String encode(Set<String> hiddenComponents) {
-        ArrayList<String> orderedComponents = new ArrayList<>(hiddenComponents);
-        Collections.sort(orderedComponents);
-        String payload = String.join("\n", orderedComponents);
-        String encoded = Base64.encodeToString(payload.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
-        return FORMAT_PREFIX + encoded;
-    }
-
-    static final class Snapshot {
-        final Set<String> hiddenComponents;
+    static final class Snapshot extends RuleConfig {
+        final boolean valid;
 
         Snapshot(Set<String> hiddenComponents) {
-            this.hiddenComponents = Collections.unmodifiableSet(new HashSet<>(hiddenComponents));
+            this(hiddenComponents, Collections.emptyList());
+        }
+
+        Snapshot(Set<String> hiddenComponents, List<String> orderedComponents) {
+            this(hiddenComponents, orderedComponents, true);
+        }
+
+        private Snapshot(Set<String> hiddenComponents, List<String> orderedComponents, boolean valid) {
+            super(hiddenComponents, orderedComponents);
+            this.valid = valid;
         }
 
         static Snapshot empty() {
@@ -241,15 +240,13 @@ final class SystemRuleStore {
 
     static final class HookStatus {
         final boolean loadedForCurrentBoot;
-        final long loadedAt;
 
-        HookStatus(boolean loadedForCurrentBoot, long loadedAt) {
+        HookStatus(boolean loadedForCurrentBoot) {
             this.loadedForCurrentBoot = loadedForCurrentBoot;
-            this.loadedAt = loadedAt;
         }
 
         static HookStatus unavailable() {
-            return new HookStatus(false, 0L);
+            return new HookStatus(false);
         }
     }
 
