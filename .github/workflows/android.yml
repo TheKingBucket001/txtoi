@@ -115,9 +115,6 @@ jobs:
             - 修复连续勾选失效、长按高亮残留及取消拖动误保存；保存成功后短暂提示“已保存”。
             - 关于页支持小窗口滚动，无法打开网页时给出提示。
 
-            ## 使用范围
-
-            已在 ColorOS 16 / Android 16 验证。剪切、复制、粘贴、全选、分享等宿主内置动作不属于统一扩展清单；系统接口变化或应用自定义菜单仍可能需要适配。
       - name: Sync release to LSPosed
         if: startsWith(github.ref, 'refs/tags/v')
         env:
