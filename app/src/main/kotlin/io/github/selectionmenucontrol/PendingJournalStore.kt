@@ -35,3 +35,25 @@ internal class PendingJournalStore(private val storage: PendingJournalStorage) {
 /** Retry a failed cleanup even when an earlier false commit already removed the memory keys. */
 internal fun finishPendingJournalCleanup(store: PendingJournalStore, record: PendingJournalRecord): Boolean =
     store.write(record) && store.clear(record.id)
+
+/** Equal rule contents can belong to distinct queued edits, e.g. A -> B -> A. */
+internal fun settlePendingRuleWrite(
+    journal: PendingJournalRead,
+    encoded: String,
+    latestAcceptedEdit: Boolean,
+    verified: Boolean,
+    uncertain: Boolean,
+    write: (PendingJournalRecord) -> Boolean,
+    clear: (String) -> Boolean,
+): Boolean {
+    if (journal === PendingJournalRead.Failed) return false
+    val record = (journal as? PendingJournalRead.Found)?.record
+    return when {
+        verified && record != null -> {
+            if (latestAcceptedEdit && record.target == encoded) clear(record.id)
+            else write(record.copy(baseline = encoded, inFlight = null))
+        }
+        !uncertain && latestAcceptedEdit && record?.target == encoded -> clear(record.id)
+        else -> !verified || record != null
+    }
+}

@@ -121,14 +121,16 @@ final class SystemMenuClassifier {
         for (ResolveInfo original : originals) classifications.put(original, UNKNOWN);
         if (context == null || originals.size() > RuleConfig.MAX_ENTRIES) return new Result(originals, classifications);
         long started = SystemClock.elapsedRealtime();
+        String key = null;
         try {
-            String key = cacheKey(context, originals, userId);
+            key = cacheKey(context, originals, userId);
             MenuPolicyCache.Value cached = cache.get(key, started);
             if (cached != null) {
                 List<ResolveInfo> display = new ArrayList<>(originals.size());
                 for (int index = 0; index < originals.size(); index++) classifications.put(originals.get(index), cached.kinds[index]);
                 for (int index : cached.order) display.add(originals.get(index));
-                ModuleDiagnostics.metric(ModuleDiagnostics.Metric.POLICY_CACHE_HIT, 1);
+                ModuleDiagnostics.metric(cached.failure ? ModuleDiagnostics.Metric.POLICY_BACKOFF_HIT
+                        : ModuleDiagnostics.Metric.POLICY_CACHE_HIT, 1);
                 return new Result(forDisplay ? display : originals, classifications);
             }
             Menu menu = (Menu) newMenu.newInstance(context);
@@ -187,6 +189,9 @@ final class SystemMenuClassifier {
         } catch (Throwable error) {
             // A partial menu cannot establish trustworthy slots for the settings list.
             for (ResolveInfo original : originals) classifications.put(original, UNKNOWN);
+            // Identical incompatible inputs should not repeat full ROM reflection on
+            // every query. Unknown results expire quickly and share normal invalidation.
+            if (key != null) cache.putFailure(key, originals.size(), SystemClock.elapsedRealtime());
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.POLICY_FAILED);
             return new Result(originals, classifications);
         } finally {
@@ -204,7 +209,11 @@ final class SystemMenuClassifier {
                 parcel.setDataSize(0);
                 info.writeToParcel(parcel, 0);
                 byte[] value = parcel.marshall();
-                digest.update(java.nio.ByteBuffer.allocate(4).putInt(value.length).array());
+                // Big-endian framing without a ByteBuffer and extra array per candidate.
+                digest.update((byte) (value.length >>> 24));
+                digest.update((byte) (value.length >>> 16));
+                digest.update((byte) (value.length >>> 8));
+                digest.update((byte) value.length);
                 digest.update(value);
             }
         } finally { parcel.recycle(); }

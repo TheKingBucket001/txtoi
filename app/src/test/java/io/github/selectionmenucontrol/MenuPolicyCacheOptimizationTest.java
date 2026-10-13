@@ -3,6 +3,8 @@ package io.github.selectionmenucontrol;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 
 import org.junit.Test;
 
@@ -70,5 +72,31 @@ public class MenuPolicyCacheOptimizationTest {
         cache.clear();
         assertNull(cache.get("user-0-shape-A", 101));
         assertNull(cache.get("user-10-shape-B", 101));
+    }
+
+    @Test public void failureBackoffKeepsOnlyUnknownForTheSameInputAndExpiresWithoutRenewal() {
+        MenuPolicyCache cache = new MenuPolicyCache();
+        cache.putFailure("user-0-shape-A", 3, 100);
+        MenuPolicyCache.Value value = cache.get("user-0-shape-A", 101);
+        assertTrue(value.failure);
+        assertArrayEquals(new int[]{0, 0, 0}, value.kinds);
+        assertArrayEquals(new int[]{0, 1, 2}, value.order);
+        assertNull(cache.get("user-0-shape-B", 101));
+        assertNull(cache.get("user-10-shape-A", 101));
+        assertNotNull(cache.get("user-0-shape-A", 100 + MenuPolicyCache.FAILURE_TTL_MS - 1));
+        assertNull(cache.get("user-0-shape-A", 100 + MenuPolicyCache.FAILURE_TTL_MS));
+    }
+
+    @Test public void notificationOrSuccessfulRetryCanEndFailureBackoff() {
+        MenuPolicyCache cache = new MenuPolicyCache();
+        cache.putFailure("policy", 1, 100);
+        cache.clear();
+        assertNull(cache.get("policy", 101));
+        cache.putFailure("policy", 1, 102);
+        cache.put("policy", new int[]{2}, new int[]{0}, 103);
+        MenuPolicyCache.Value recovered = cache.get("policy", 104);
+        assertFalse(recovered.failure);
+        assertArrayEquals(new int[]{2}, recovered.kinds);
+        assertNotNull(cache.get("policy", 103 + MenuPolicyCache.FAILURE_TTL_MS));
     }
 }

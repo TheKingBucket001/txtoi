@@ -16,7 +16,7 @@ final class ModuleDiagnostics {
         ROOT_DENIED, ROOT_UNAVAILABLE, ROOT_LOCKED, ROOT_EXPIRED, ROOT_STALE,
         ROOT_STORAGE, ROOT_WRITE, ROOT_VERIFY, ROOT_PROTOCOL, ROOT_IO, ROOT_INTERRUPTED
     }
-    enum Metric { QUERY_MS, POLICY_MS, POLICY_CACHE_HIT, RULE_CACHE_HIT, ROOT_MS, SAVE_MS, QUEUE_DEPTH }
+    enum Metric { QUERY_MS, POLICY_MS, POLICY_CACHE_HIT, POLICY_BACKOFF_HIT, RULE_CACHE_HIT, ROOT_MS, SAVE_MS, QUEUE_DEPTH }
     private static final ModuleDiagnostics INSTANCE = new ModuleDiagnostics(() -> System.nanoTime() / 1_000_000L);
     static final int MAX_EVENTS = 64;
     static final int MAX_OUTPUT = 16 * 1024;

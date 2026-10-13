@@ -216,16 +216,12 @@ internal object RuleSaveCoordinator {
         lastUncertain = result.uncertain
         val encoded = next.encode()
         val settled = journalMutex.withLock {
+            // Read edit identity on the UI dispatcher while staging is excluded by this lock.
+            // An edit accepted during the following IO will stage after this settlement.
+            val latestAcceptedEdit = acceptedDraft === next
             withContext(Dispatchers.IO) {
-                val journal = readJournal()
-                if (journal === PendingJournalRead.Failed) return@withContext false
-                val record = (journal as? PendingJournalRead.Found)?.record
-                if (result.verified && record != null) {
-                    if (record.target == encoded) clearJournal(record.id)
-                    else writeJournal(record.copy(baseline = encoded, inFlight = null))
-                } else if (!result.uncertain && record?.target == encoded) {
-                    clearJournal(record.id)
-                } else !result.verified || record != null
+                settlePendingRuleWrite(readJournal(), encoded, latestAcceptedEdit,
+                    result.verified, result.uncertain, ::writeJournal, ::clearJournal)
             }
         }
         if (!settled) {

@@ -53,6 +53,9 @@ Linux 发布与 Windows 本地构建会使用不同的 AAPT2 二进制，校验�
 
 ```powershell
 .\gradlew.bat :app:assembleRelease :app:lintRelease :app:verifyReleaseModernXposedMetadata -Pr8Candidate=true --dependency-verification=strict --no-daemon
+python .github/scripts/verify_r8_entrypoints.py --apk app/build/outputs/apk/release/app-release.apk --mapping app/build/outputs/mapping/release/mapping.txt --dexdump "$env:ANDROID_HOME/build-tools/36.0.0/dexdump.exe"
 ```
 
-记录 APK 体积、DEX、冷启动和内存的改前／改后结果，检查 Modern `java_init.list` 对应的入口类仍可加载，实际验证 Hook、菜单识别、保存、更新、全部页面及取消操作。`app/proguard-rules.pro` 保留外部加载的模块入口；系统反射目标属于设备框架，无需保留整个应用包。只有收益和完整功能均通过验证，才可调整默认设置。
+入口验证工具读取同次构建的 mapping 和 APK 中全部实际 DEX，逐类核对模块保留字面名称、公共零参构造和两个外部回调的完整签名，以及三个 ViewModel 的公共反射构造。请将 `--dexdump` 改为本机 Android SDK Build Tools 中的实际可执行文件；Linux 使用 `dexdump`。JSON 结果包含 APK、mapping 摘要和每个已核对的方法，缺类、错误参数或访问权限均会停止验证。不要把旧 mapping 与新 APK 混用。
+
+记录 APK 体积、DEX、冷启动和内存的改前／改后结果，实际验证 Hook、菜单识别、保存、更新、全部页面及取消操作。静态入口通过不能代替实机行为验证。`app/proguard-rules.pro` 保留外部加载的模块入口；系统反射目标属于设备框架，无需保留整个应用包。只有收益和完整功能均通过验证，才可调整默认设置。
