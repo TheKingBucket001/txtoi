@@ -17,6 +17,11 @@ val releaseKeyAlias = signingProperties.getProperty("keyAlias") ?: System.getenv
 val releaseKeyPassword = signingProperties.getProperty("keyPassword") ?: System.getenv("ANDROID_KEY_PASSWORD")
 val releaseSigningReady = listOf(releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword)
     .all { !it.isNullOrBlank() }
+// Keep production packaging unchanged until the candidate has passed device checks.
+val r8Candidate = providers.gradleProperty("r8Candidate").map { value ->
+    require(value == "true" || value == "false") { "r8Candidate must be true or false" }
+    value.toBoolean()
+}.getOrElse(false)
 
 android {
     namespace = "io.github.selectionmenucontrol"
@@ -26,8 +31,8 @@ android {
         applicationId = "io.github.selectionmenucontrol"
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
-        versionName = "0.6.2"
+        versionCode = 18
+        versionName = "0.7.0"
     }
 
     signingConfigs {
@@ -43,7 +48,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = r8Candidate
+            isShrinkResources = r8Candidate
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             if (releaseSigningReady) {
                 signingConfig = signingConfigs.getByName("release")
             }

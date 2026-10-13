@@ -4,15 +4,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.ActivityNotFoundException
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Bundle
-import android.util.Log
+import android.app.Application
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
@@ -29,24 +27,39 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.core.net.toUri
+import android.content.ClipData
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -58,6 +71,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -71,12 +88,11 @@ import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 import top.yukonga.miuix.kmp.window.WindowDialog
-import java.net.HttpURLConnection
-import java.net.URL
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         setContent {
             val controller = remember { ThemeController(ColorSchemeMode.MonetSystem, keyColor = Color(0xFF2879FF)) }
             MiuixTheme(controller = controller) {
@@ -86,98 +102,82 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class GateState(
+internal data class GateState(
     val checking: Boolean = true,
     val systemHookReady: Boolean = false,
     val rootReady: Boolean = false,
     val rootMessage: String = "等待系统框架检测完成",
 )
 
-private data class UpdateInfo(
-    val version: String,
-    val releaseUrl: String,
-)
+internal class EnvironmentViewModel(application: Application) : AndroidViewModel(application) {
+    private val mutableState = MutableStateFlow(GateState())
+    val state = mutableState.asStateFlow()
+    private var check: Job? = null
+    private var started = false
 
-private sealed interface UpdateCheckResult {
-    data class Available(val update: UpdateInfo) : UpdateCheckResult
-    data object UpToDate : UpdateCheckResult
-    data object Failed : UpdateCheckResult
-}
+    fun ensureChecked() { if (!started) refresh() }
 
-private object UpdateSettings {
-    private const val PREFERENCES_NAME = "update_settings"
-    private const val AUTO_CHECK_KEY = "auto_check"
-    private const val CACHED_VERSION_KEY = "cached_version"
-    private const val CACHED_URL_KEY = "cached_url"
-    private const val CACHED_AT_KEY = "cached_at"
-
-    fun isAutoCheckEnabled(context: Context): Boolean = preferences(context).getBoolean(AUTO_CHECK_KEY, true)
-
-    fun setAutoCheckEnabled(context: Context, enabled: Boolean) {
-        preferences(context).edit().putBoolean(AUTO_CHECK_KEY, enabled).apply()
+    fun refresh() {
+        if (check?.isActive == true) return
+        started = true
+        mutableState.value = GateState(checking = true, rootMessage = "正在验证 Root 授权")
+        check = viewModelScope.launch {
+            var rootGranted = false
+            try {
+                mutableState.value = withContext(Dispatchers.IO) {
+                    environmentCheckMutex.withLock {
+                        ensureActive()
+                        val root = RootAccess.check()
+                        rootGranted = root.granted
+                        ensureActive()
+                        val hook = if (root.granted) waitForSystemHook(getApplication()) else SystemRuleStore.HookStatus.unavailable()
+                        GateState(false, hook.loadedForCurrentBoot, root.granted, root.message)
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                ModuleDiagnostics.fault(if (rootGranted) ModuleDiagnostics.Code.PROBE_FAILED else ModuleDiagnostics.Code.ROOT_FAILED)
+                mutableState.value = GateState(false, false, rootGranted,
+                    if (rootGranted) "系统环境检测失败，请重新检查" else "无法完成 Root 验证，请重新检查")
+            }
+        }
     }
-
-    fun getFreshCachedRelease(context: Context): UpdateInfo? {
-        val preferences = preferences(context)
-        val cachedAt = preferences.getLong(CACHED_AT_KEY, 0L)
-        val age = System.currentTimeMillis() - cachedAt
-        if (cachedAt <= 0L || age !in 0..UPDATE_CACHE_VALIDITY_MS) return null
-        val version = preferences.getString(CACHED_VERSION_KEY, "").orEmpty()
-        val releaseUrl = preferences.getString(CACHED_URL_KEY, "").orEmpty()
-        return UpdateInfo(version, releaseUrl).takeIf { it.version.isNotBlank() && it.releaseUrl.isNotBlank() }
-    }
-
-    fun saveCachedRelease(context: Context, update: UpdateInfo) {
-        preferences(context).edit()
-            .putString(CACHED_VERSION_KEY, update.version)
-            .putString(CACHED_URL_KEY, update.releaseUrl)
-            .putLong(CACHED_AT_KEY, System.currentTimeMillis())
-            .apply()
-    }
-
-    private fun preferences(context: Context) = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 }
 
 @Composable
 private fun ModuleApp(activity: MainActivity) {
-    var gateState by remember { mutableStateOf(GateState()) }
-    var refreshSignal by remember { mutableIntStateOf(0) }
-    var showAbout by remember { mutableStateOf(false) }
-    var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+    val environment = remember(activity) { ViewModelProvider(activity)[EnvironmentViewModel::class.java] }
+    val gateState by environment.state.collectAsState()
+    var showAbout by rememberSaveable { mutableStateOf(false) }
+    val updates = remember(activity) { ViewModelProvider(activity)[UpdateViewModel::class.java] }
+    val updateState by updates.state.collectAsState()
+    var foregroundSignal by remember { mutableIntStateOf(0) }
     var autoCheckEnabled by remember { mutableStateOf(UpdateSettings.isAutoCheckEnabled(activity)) }
-    val autoCheckOnLaunch = remember { autoCheckEnabled }
 
-    // This effect belongs to the Activity's root composition, so page navigation and
-    // setting changes cannot start another check during the same app session.
-    LaunchedEffect(Unit) {
-        if (!autoCheckOnLaunch) return@LaunchedEffect
-        when (val result = withContext(Dispatchers.IO) { checkForUpdate(activity) }) {
-            is UpdateCheckResult.Available -> availableUpdate = result.update
-            UpdateCheckResult.UpToDate -> Toast.makeText(activity, "暂无更新", Toast.LENGTH_SHORT).show()
-            UpdateCheckResult.Failed -> Toast.makeText(activity, "检查更新失败", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    LaunchedEffect(refreshSignal) {
-        gateState = GateState(checking = true, rootMessage = "正在验证 Root 授权")
-        gateState = withContext(Dispatchers.IO) {
-            environmentCheckMutex.withLock {
-                ensureActive()
-                val root = RootAccess.check()
-                ensureActive()
-                val hook = if (root.granted) waitForSystemHook(activity) else SystemRuleStore.HookStatus.unavailable()
-                GateState(
-                    checking = false,
-                    systemHookReady = hook.loadedForCurrentBoot,
-                    rootReady = root.granted,
-                    rootMessage = root.message,
-                )
+    DisposableEffect(activity, updates, autoCheckEnabled) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    foregroundSignal++
+                    if (autoCheckEnabled) updates.automaticCheck()
+                }
+                Lifecycle.Event.ON_STOP -> if (!activity.isChangingConfigurations) updates.cancelCheck()
+                else -> Unit
             }
         }
+        activity.lifecycle.addObserver(observer)
+        onDispose { activity.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(updateState.noticeVersion, foregroundSignal) {
+        if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            updates.consumeNotice()?.let { Toast.makeText(activity, it, Toast.LENGTH_SHORT).show() }
+        }
     }
 
+    LaunchedEffect(environment) { environment.ensureChecked() }
+
     if (gateState.checking || !gateState.systemHookReady || !gateState.rootReady) {
-        EnvironmentGate(gateState) { refreshSignal++ }
+        EnvironmentGate(gateState, environment::refresh)
     } else {
         BackHandler(enabled = showAbout) {
             showAbout = false
@@ -195,17 +195,20 @@ private fun ModuleApp(activity: MainActivity) {
                     onAutoCheckChange = { enabled ->
                         UpdateSettings.setAutoCheckEnabled(activity, enabled)
                         autoCheckEnabled = enabled
+                        if (!enabled) updates.cancelCheck(automaticOnly = true)
                     },
+                    checkingUpdate = updateState.checking,
+                    onManualUpdate = updates::manualCheck,
                 )
             }
             else RuleScreen(activity) { showAbout = true }
         }
     }
 
-    availableUpdate?.let { update ->
+    updateState.available?.let { update ->
         UpdateDialog(
             update = update,
-            onDismiss = { availableUpdate = null },
+            onDismiss = updates::dismissUpdate,
             onOpenRelease = {
                 openWebPage(activity, update.releaseUrl, "无法打开更新页面")
             },
@@ -215,7 +218,7 @@ private fun ModuleApp(activity: MainActivity) {
 
 private fun openWebPage(activity: MainActivity, url: String, failureMessage: String) {
     try {
-        activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        activity.startActivity(Intent(Intent.ACTION_VIEW, url.toUri()))
     } catch (_: ActivityNotFoundException) {
         Toast.makeText(activity, failureMessage, Toast.LENGTH_SHORT).show()
     } catch (_: SecurityException) {
@@ -229,148 +232,43 @@ private fun UpdateDialog(update: UpdateInfo, onDismiss: () -> Unit, onOpenReleas
         show = true,
         onDismissRequest = onDismiss,
         content = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(modifier = Modifier.dialogContent(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("发现新版本", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Text(
                     "${update.version} 已发布。",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    TextButton(text = "稍后", onClick = onDismiss, modifier = Modifier.weight(1f))
-                    TextButton(
-                        text = "查看更新",
-                        onClick = onOpenRelease,
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.textButtonColorsPrimary(),
-                    )
-                }
+                DialogActions("稍后", onDismiss, "查看更新", onOpenRelease)
             }
         },
     )
 }
 
-private fun checkForUpdate(context: Context): UpdateCheckResult {
-    UpdateSettings.getFreshCachedRelease(context)?.let { cached ->
-        Log.i(UPDATE_LOG_TAG, "Using cached update result")
-        return resultForRelease(cached)
-    }
-    if (!waitForValidatedNetwork(context)) {
-        Log.w(UPDATE_LOG_TAG, "Update check skipped: no validated network")
-        return UpdateCheckResult.Failed
-    }
-
-    var lastFailure: Throwable? = null
-    repeat(UPDATE_CHECK_ATTEMPTS) { attempt ->
-        try {
-            val release = requestLatestRelease()
-            UpdateSettings.saveCachedRelease(context, release)
-            Log.i(UPDATE_LOG_TAG, "Update check succeeded on attempt ${attempt + 1}")
-            return resultForRelease(release)
-        } catch (error: Throwable) {
-            lastFailure = error
-            Log.w(UPDATE_LOG_TAG, "Update check attempt ${attempt + 1} failed: ${error.javaClass.simpleName}")
-            if (attempt + 1 < UPDATE_CHECK_ATTEMPTS) {
-                Thread.sleep(UPDATE_RETRY_DELAY_MS)
-            }
-        }
-    }
-    Log.w(UPDATE_LOG_TAG, "Update check failed after $UPDATE_CHECK_ATTEMPTS attempts", lastFailure)
-    return UpdateCheckResult.Failed
-}
-
-private fun requestLatestRelease(): UpdateInfo {
-    var connection: HttpURLConnection? = null
-    try {
-        connection = (URL(LATEST_RELEASE_URL).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = UPDATE_REQUEST_TIMEOUT_MS
-            readTimeout = UPDATE_REQUEST_TIMEOUT_MS
-            setRequestProperty("User-Agent", "txtoi-android-update-check")
-        }
-        if (connection.responseCode != HttpURLConnection.HTTP_OK) {
-            throw IllegalStateException("Unexpected HTTP status ${connection.responseCode}")
-        }
-        val releaseUrl = connection.url.toString()
-        val releasePath = Uri.parse(releaseUrl).path.orEmpty()
-        require(releasePath.contains("/releases/tag/")) { "Latest release did not redirect to a tag" }
-        val version = Uri.parse(releaseUrl).lastPathSegment.orEmpty().trim()
-        require(version.isNotBlank()) { "Release tag is missing" }
-        return UpdateInfo(version, releaseUrl)
-    } finally {
-        connection?.disconnect()
-    }
-}
-
-private fun resultForRelease(release: UpdateInfo): UpdateCheckResult =
-    if (isVersionNewer(release.version, BuildConfig.VERSION_NAME)) {
-        UpdateCheckResult.Available(release)
-    } else {
-        UpdateCheckResult.UpToDate
-    }
-
-private fun waitForValidatedNetwork(context: Context): Boolean {
-    val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
-    val deadline = System.currentTimeMillis() + NETWORK_READY_TIMEOUT_MS
-    do {
-        val network = connectivity.activeNetwork
-        val capabilities = network?.let(connectivity::getNetworkCapabilities)
-        if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-            && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-            return true
-        }
-        Thread.sleep(500)
-    } while (System.currentTimeMillis() < deadline)
-    return false
-}
-
-private fun isVersionNewer(remote: String, local: String): Boolean {
-    val remoteParts = parseVersion(remote) ?: return false
-    val localParts = parseVersion(local) ?: return false
-    val count = maxOf(remoteParts.size, localParts.size)
-    for (index in 0 until count) {
-        val remotePart = remoteParts.getOrElse(index) { 0 }
-        val localPart = localParts.getOrElse(index) { 0 }
-        if (remotePart != localPart) return remotePart > localPart
-    }
-    return false
-}
-
-private fun parseVersion(value: String): List<Int>? {
-    val numericVersion = value.trim().removePrefix("v").removePrefix("V").substringBefore('-')
-    val parts = numericVersion.split('.')
-    if (parts.isEmpty() || parts.any { it.isBlank() }) return null
-    return parts.map { it.toIntOrNull() ?: return null }
-}
-
-private const val LATEST_RELEASE_URL = "https://github.com/TheKingBucket001/txtoi/releases/latest"
-private const val NETWORK_READY_TIMEOUT_MS = 12_000L
-private const val UPDATE_REQUEST_TIMEOUT_MS = 5_000
-private const val UPDATE_CHECK_ATTEMPTS = 2
-private const val UPDATE_RETRY_DELAY_MS = 1_500L
-private const val UPDATE_CACHE_VALIDITY_MS = 60L * 60L * 1_000L
-private const val UPDATE_LOG_TAG = "SelectionMenuControl"
-
 private val environmentCheckMutex = Mutex()
 
-private suspend fun waitForSystemHook(activity: ComponentActivity): SystemRuleStore.HookStatus {
-    val request = SystemRuleStore.beginProbe() ?: return SystemRuleStore.HookStatus.unavailable()
+private suspend fun waitForSystemHook(activity: Context): SystemRuleStore.HookStatus {
+    val request = SystemRuleStore.beginProbe(activity) ?: return SystemRuleStore.HookStatus.unavailable()
     val deadline = android.os.SystemClock.elapsedRealtime() + 2_000L
     try {
         do {
             currentCoroutineContext().ensureActive()
             activity.packageManager.queryIntentActivities(
-                Intent(Intent.ACTION_PROCESS_TEXT).setType("text/plain"),
+                Intent(Intent.ACTION_PROCESS_TEXT).setType("text/plain")
+                    .putExtra(SystemRuleStore.QUERY_ORIGINAL_EXTRA, true),
                 PackageManager.MATCH_ALL,
             )
             delay(100)
             val status = SystemRuleStore.readProbeResponse(activity, request)
-            if (status.loadedForCurrentBoot) return status
+            if (status.loadedForCurrentBoot) {
+                ModuleDiagnostics.recover(ModuleDiagnostics.Code.PROBE_FAILED)
+                return status
+            }
         } while (android.os.SystemClock.elapsedRealtime() < deadline)
         return SystemRuleStore.readProbeResponse(activity, request)
     } catch (error: Exception) {
         if (error is CancellationException) throw error
-        Log.w("SelectionMenuControl", "System hook probe failed", error)
+        ModuleDiagnostics.fault(ModuleDiagnostics.Code.PROBE_FAILED)
         return SystemRuleStore.readProbeResponse(activity, request)
     } finally {
         SystemRuleStore.cancelProbe(request)
@@ -383,8 +281,7 @@ private fun EnvironmentGate(state: GateState, onRefresh: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(MiuixTheme.colorScheme.background)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
+            .safeDrawingPadding(),
         contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 28.dp, bottom = 24.dp),
     ) {
         item {
@@ -393,7 +290,7 @@ private fun EnvironmentGate(state: GateState, onRefresh: () -> Unit) {
                 if (state.checking) "正在检查运行环境" else "运行环境未就绪",
                 modifier = Modifier.padding(top = 6.dp),
                 style = MiuixTheme.textStyles.body1,
-                color = if (state.checking) MiuixTheme.colorScheme.onBackgroundVariant else Color(0xFFD95D39),
+                color = if (state.checking) MiuixTheme.colorScheme.onBackgroundVariant else MiuixTheme.colorScheme.error,
                 fontWeight = FontWeight.Bold,
             )
             Text(
@@ -455,7 +352,7 @@ private fun GateRow(title: String, passed: Boolean, summary: String) {
                 .padding(top = 6.dp)
                 .size(9.dp)
                 .clip(androidx.compose.foundation.shape.CircleShape)
-                .background(if (passed) Color(0xFF21A366) else Color(0xFFD95D39)),
+                .background(if (passed) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.error),
         )
         Column(modifier = Modifier.padding(start = 14.dp).weight(1f)) {
             Text(title, style = MiuixTheme.textStyles.body1, fontWeight = FontWeight.Bold)
@@ -471,28 +368,38 @@ private fun GateRow(title: String, passed: Boolean, summary: String) {
             if (passed) "已就绪" else "未通过",
             modifier = Modifier.padding(start = 12.dp, top = 1.dp),
             style = MiuixTheme.textStyles.body2,
-            color = if (passed) Color(0xFF21A366) else Color(0xFFD95D39),
+            color = if (passed) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.error,
             fontWeight = FontWeight.Bold,
         )
     }
 }
 
 @Composable
-@Suppress("UseKtx")
 private fun AboutScreen(
     activity: MainActivity,
     onBack: () -> Unit,
     autoCheckEnabled: Boolean,
     onAutoCheckChange: (Boolean) -> Unit,
+    checkingUpdate: Boolean,
+    onManualUpdate: () -> Unit,
 ) {
-    var showDailyMenu by remember { mutableStateOf(false) }
-    BackHandler(enabled = showDailyMenu) { showDailyMenu = false }
+    var showDailyMenu by rememberSaveable { mutableStateOf(false) }
+    var showDiagnostics by rememberSaveable { mutableStateOf(false) }
+    var diagnosticText by remember { mutableStateOf("") }
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(showDiagnostics) {
+        if (showDiagnostics) diagnosticText = ModuleDiagnostics.snapshot()
+    }
+    BackHandler(enabled = showDailyMenu || showDiagnostics) {
+        showDailyMenu = false
+        showDiagnostics = false
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(MiuixTheme.colorScheme.background)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
+            .safeDrawingPadding(),
     ) {
         Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) {
@@ -500,6 +407,7 @@ private fun AboutScreen(
                     painter = painterResource(R.drawable.ic_back),
                     contentDescription = "返回",
                     modifier = Modifier.size(24.dp),
+                    colorFilter = ColorFilter.tint(MiuixTheme.colorScheme.onBackground),
                 )
             }
             Text(
@@ -507,8 +415,8 @@ private fun AboutScreen(
                 style = MiuixTheme.textStyles.subtitle,
                 fontWeight = FontWeight.Bold,
                 fontSize = 19.sp,
-                maxLines = 1,
-                softWrap = false,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
                 textAlign = TextAlign.Center,
             )
@@ -522,7 +430,7 @@ private fun AboutScreen(
                     .clip(RoundedCornerShape(24.dp)),
             ) {
                 Column(
-                    modifier = Modifier.fillMaxWidth().background(Color(0xFFF0F6FF)).padding(16.dp),
+                    modifier = Modifier.fillMaxWidth().background(MiuixTheme.colorScheme.surfaceContainer).padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Image(
@@ -534,9 +442,10 @@ private fun AboutScreen(
                             onLongClick = { showDailyMenu = true },
                         ),
                     )
-                    Text("系统文本菜单", color = Color(0xFF1976D2), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    Text("文本菜单控制", fontWeight = FontWeight.Bold, fontSize = 26.sp, color = Color(0xFF171717))
-                    Text("管理全系统文本选择菜单中的 PROCESS_TEXT 扩展项。", color = Color(0xFF5E6570), fontSize = 14.sp, lineHeight = 20.sp)
+                    Text("系统文本菜单", color = MiuixTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text("文本菜单控制", fontWeight = FontWeight.Bold, fontSize = 26.sp, color = MiuixTheme.colorScheme.onSurfaceContainer)
+                    Text("隐藏不需要的选项，调整扩展项顺序。",
+                        color = MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = 0.7f), fontSize = 14.sp, lineHeight = 20.sp)
                 }
             }
 
@@ -565,6 +474,18 @@ private fun AboutScreen(
                     title = "自动检测更新",
                     summary = "打开模块时检测新版本",
                 )
+                AboutInfoDivider()
+                AboutActionRow(
+                    if (checkingUpdate) "正在检查更新" else "检查更新",
+                    "查看是否有新版本",
+                    if (checkingUpdate) "检查中" else "检查",
+                    if (checkingUpdate) null else onManualUpdate,
+                )
+            }
+            Card(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                AboutActionRow("应用诊断", "查看或复制本次运行的诊断信息", "查看") {
+                    showDiagnostics = true
+                }
             }
         }
     }
@@ -573,7 +494,7 @@ private fun AboutScreen(
             show = true,
             onDismissRequest = { showDailyMenu = false },
             content = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(modifier = Modifier.dialogContent(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("今日菜单", fontSize = 20.sp, fontWeight = FontWeight.Bold)
                     Text("复制一点快乐\n粘贴一点好运\n把烦恼留在菜单外", fontSize = 16.sp, lineHeight = 28.sp)
                     TextButton(
@@ -585,13 +506,38 @@ private fun AboutScreen(
             },
         )
     }
+    if (showDiagnostics) {
+        WindowDialog(show = true, onDismissRequest = { showDiagnostics = false }, content = {
+            Column(modifier = Modifier.dialogContent(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("应用诊断", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    diagnosticText,
+                    modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp,
+                )
+                DialogActions("关闭", { showDiagnostics = false }, "复制", {
+                    scope.launch {
+                        try {
+                            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("应用诊断", diagnosticText)))
+                            Toast.makeText(activity, "已复制", Toast.LENGTH_SHORT).show()
+                        } catch (error: Exception) {
+                            if (error is CancellationException) throw error
+                            Toast.makeText(activity, "复制失败，请重试", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }, confirmEnabled = diagnosticText.isNotEmpty())
+            }
+        })
+    }
 }
 
 @Composable
 private fun AboutInfoRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(label, style = MiuixTheme.textStyles.body1, color = MiuixTheme.colorScheme.onBackgroundVariant, modifier = Modifier.weight(1f))
-        Text(value, style = MiuixTheme.textStyles.body1, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1, textAlign = TextAlign.End)
+        Text(value, modifier = Modifier.weight(1f), style = MiuixTheme.textStyles.body1, fontWeight = FontWeight.Bold,
+            fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.End)
     }
 }
 
@@ -608,6 +554,6 @@ private fun AboutActionRow(title: String, summary: String, action: String, onCli
             Text(title, style = MiuixTheme.textStyles.body1, fontWeight = FontWeight.Bold)
             Text(summary, style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onBackgroundVariant)
         }
-        Text(action, color = Color(0xFF1976D2), fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 12.dp))
+        Text(action, color = MiuixTheme.colorScheme.primary, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 12.dp))
     }
 }

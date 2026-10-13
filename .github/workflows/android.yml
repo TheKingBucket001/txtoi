@@ -1,7 +1,7 @@
 name: Android CI
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
@@ -14,31 +14,36 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    outputs:
+      apk_name: ${{ steps.release.outputs.apk_name }}
+      apk_sha256: ${{ steps.release.outputs.apk_sha256 }}
+      version_code: ${{ steps.release.outputs.version_code }}
+      version_name: ${{ steps.release.outputs.version_name }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Verify signed release tag
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag_ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
-          test "$(jq -r .object.type <<< "$tag_ref")" = tag
-          tag_object=$(jq -r .object.sha <<< "$tag_ref")
-          tag_data=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}")
-          jq -e --arg sha "$GITHUB_SHA" '.verification.verified == true and .object.type == "commit" and .object.sha == $sha and (.verification.signature | startswith("-----BEGIN SSH SIGNATURE-----"))' <<< "$tag_data" >/dev/null
-      - uses: actions/setup-java@v5
+          python3 .github/scripts/publish_release.py verify-tag --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: zulu
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           packages: platform-tools
           log-accepted-android-sdk-licenses: false
-      - name: Install Android platform
-        run: sdkmanager 'platforms;android-37.0'
+      - name: Install Android platform and verification tools
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0'
       - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
+        run: |
+          printf '%s\n' '497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7  gradle/wrapper/gradle-wrapper.jar' | sha256sum --check --strict
+          chmod +x ./gradlew
       - name: Restore release signing configuration
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -47,6 +52,7 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           test -n "$ANDROID_KEYSTORE_BASE64"
           mkdir -p .local
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > .local/txtoi-release.keystore
@@ -56,79 +62,62 @@ jobs:
           keyAlias=$ANDROID_KEY_ALIAS
           keyPassword=$ANDROID_KEY_PASSWORD
           EOF
+      - name: Test release tooling
+        run: python3 -m unittest discover -s .github/scripts/tests -v
       - name: Build and lint
         run: |
+          set -euo pipefail
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            ./gradlew :app:assembleRelease :app:lintRelease :app:testDebugUnitTest :app:verifyModernXposedMetadata :app:verifyReleaseModernXposedMetadata --no-daemon
+            ./gradlew :app:assembleRelease :app:lintRelease :app:testDebugUnitTest :app:verifyReleaseModernXposedMetadata --dependency-verification=strict --no-daemon
           else
-            ./gradlew :app:assembleDebug :app:lintDebug :app:testDebugUnitTest :app:verifyModernXposedMetadata --no-daemon
+            ./gradlew :app:lintDebug :app:testDebugUnitTest :app:verifyModernXposedMetadata --dependency-verification=strict --no-daemon
           fi
-      - name: Name release APK
+      - name: Verify release APK identity
+        id: release
         if: startsWith(github.ref, 'refs/tags/v')
-        run: cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/txtoi-${{ github.ref_name }}.apk
-      - name: Upload release APK
+        run: |
+          set -euo pipefail
+          apk_name="txtoi-${GITHUB_REF_NAME}.apk"
+          apk="app/build/outputs/apk/release/$apk_name"
+          cp app/build/outputs/apk/release/app-release.apk "$apk"
+          python3 .github/scripts/verify_release_apk.py --apk "$apk" --metadata app/build/outputs/apk/release/output-metadata.json --tag "$GITHUB_REF_NAME" --build-tools "$ANDROID_HOME/build-tools/36.0.0" --github-output "$GITHUB_OUTPUT"
+      - name: Upload verified release APK
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: txtoi-release-${{ github.ref_name }}
           path: app/build/outputs/apk/release/txtoi-${{ github.ref_name }}.apk
           if-no-files-found: error
-      - name: Prepare LSPosed mirror release
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          set -euo pipefail
-          metadata=app/build/outputs/apk/release/output-metadata.json
-          version_code=$(jq -er '.elements[0].versionCode' "$metadata")
-          version_name=$(jq -er '.elements[0].versionName' "$metadata")
-          test "$version_code" -gt 0
-          test -n "$version_name"
-          test "$GITHUB_REF_NAME" = "v$version_name"
-          echo "LSPOSED_TAG=$version_code-$version_name" >> "$GITHUB_ENV"
-          echo "LSPOSED_VERSION=$version_name" >> "$GITHUB_ENV"
-          echo "LSPOSED_ASSET=app/build/outputs/apk/release/txtoi-${GITHUB_REF_NAME}.apk" >> "$GITHUB_ENV"
-      - name: Verify signed LSPosed mirror tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ secrets.XPOSED_REPO_TOKEN }}
-          MIRROR_REPOSITORY: Xposed-Modules-Repo/io.github.selectionmenucontrol
-        run: |
-          set -euo pipefail
-          : "${GH_TOKEN:?XPOSED_REPO_TOKEN is required for LSPosed release sync}"
-          tag_ref=$(gh api "repos/${MIRROR_REPOSITORY}/git/ref/tags/${LSPOSED_TAG}")
-          test "$(jq -r .object.type <<< "$tag_ref")" = tag
-          tag_object=$(jq -r .object.sha <<< "$tag_ref")
-          tag_data=$(gh api "repos/${MIRROR_REPOSITORY}/git/tags/${tag_object}")
-          jq -e --arg sha "$GITHUB_SHA" '.verification.verified == true and .object.type == "commit" and .object.sha == $sha and (.verification.signature | startswith("-----BEGIN SSH SIGNATURE-----"))' <<< "$tag_data" >/dev/null
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Remove signing files
+        if: always() && startsWith(github.ref, 'refs/tags/v')
+        run: rm -f signing.properties .local/txtoi-release.keystore
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.repository }}-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          name: ${{ github.ref_name }}
-          files: app/build/outputs/apk/release/txtoi-${{ github.ref_name }}.apk
-          body: |
-            ## 改进
-
-            - 修复“朗读”等可移动项默认排到系统特殊项前面的问题：按当前系统生成的菜单和工具栏顺序排列，恢复默认排序也采用这一顺序。
-            - 固定、隐藏和检测不可用的选项仍不能拖动；调整其他选项时保留这些锁定位置。
-            - 保留自动保存、恢复默认排序及完整卡片拖动边界。
-
-      - name: Sync release to LSPosed
-        if: startsWith(github.ref, 'refs/tags/v')
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: txtoi-release-${{ github.ref_name }}
+          path: release-apk
+      - name: Stage, verify and publish both repositories
         env:
-          GH_TOKEN: ${{ secrets.XPOSED_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          MIRROR_TOKEN: ${{ secrets.XPOSED_REPO_TOKEN }}
           MIRROR_REPOSITORY: Xposed-Modules-Repo/io.github.selectionmenucontrol
+          APK_NAME: ${{ needs.verify.outputs.apk_name }}
+          APK_SHA256: ${{ needs.verify.outputs.apk_sha256 }}
+          VERSION_CODE: ${{ needs.verify.outputs.version_code }}
+          VERSION_NAME: ${{ needs.verify.outputs.version_name }}
         run: |
           set -euo pipefail
-          : "${GH_TOKEN:?XPOSED_REPO_TOKEN is required for LSPosed release sync}"
-          release_notes="$RUNNER_TEMP/lsposed-release-notes.md"
-          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$release_notes"
-          if gh release view "$LSPOSED_TAG" --repo "$MIRROR_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$LSPOSED_TAG" --repo "$MIRROR_REPOSITORY" --title "$LSPOSED_VERSION" --notes-file "$release_notes"
-            gh release upload "$LSPOSED_TAG" "$LSPOSED_ASSET" --repo "$MIRROR_REPOSITORY" --clobber
-          else
-            gh release create "$LSPOSED_TAG" "$LSPOSED_ASSET" --verify-tag --repo "$MIRROR_REPOSITORY" --title "$LSPOSED_VERSION" --notes-file "$release_notes"
-          fi
-          asset_name=$(basename "$LSPOSED_ASSET")
-          expected_digest="sha256:$(sha256sum "$LSPOSED_ASSET" | awk '{print $1}')"
-          mirror_digest=$(gh release view "$LSPOSED_TAG" --repo "$MIRROR_REPOSITORY" --json assets --jq ".assets[] | select(.name == \"$asset_name\") | .digest")
-          test "$mirror_digest" = "$expected_digest"
+          python3 .github/scripts/publish_release.py publish --repo "$GITHUB_REPOSITORY" --mirror-repo "$MIRROR_REPOSITORY" --tag "$GITHUB_REF_NAME" --mirror-tag "$VERSION_CODE-$VERSION_NAME" --commit "$GITHUB_SHA" --version "$VERSION_NAME" --apk "release-apk/$APK_NAME" --sha256 "$APK_SHA256" --notes .github/release-notes.md

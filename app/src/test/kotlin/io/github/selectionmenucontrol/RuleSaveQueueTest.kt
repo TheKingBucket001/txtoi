@@ -13,6 +13,63 @@ import org.junit.Test
 
 class RuleSaveQueueTest {
     @Test
+    fun uncertainWriterStopsLaterWritesAndKeepsTheLatestCompleteDraft() = runBlocking {
+        withTimeout(3_000) {
+            val release = CompletableDeferred<Boolean>()
+            val written = mutableListOf<Int>()
+            val queue = RuleSaveQueue(this, persist = { value: Int -> written.add(value); release.await() },
+                read = { 0 }, keepDraftOnFailure = { true })
+            queue.initialize(0)
+            queue.submit(1)
+            queue.submit(2)
+            queue.submit(3)
+            release.complete(false)
+            queue.state.filterNotNull().first { !it.pending }
+            assertEquals(listOf(1), written)
+            assertEquals(3, queue.state.value!!.value)
+            assertTrue(queue.state.value!!.verificationPending)
+        }
+    }
+    @Test
+    fun unreadableFailureReadKeepsTheDraftAndQueueCanResume() = runBlocking {
+        val queue = RuleSaveQueue(this, persist = { value: Int -> value == 2 },
+            read = { -1 }, isAuthoritative = { it >= 0 })
+        queue.initialize(0)
+        queue.submit(1)
+        assertEquals(1, queue.state.value!!.value)
+        assertTrue(queue.state.value!!.verificationPending)
+        queue.submit(2)
+        assertEquals(2, queue.state.value!!.value)
+        assertFalse(queue.state.value!!.verificationPending)
+    }
+
+    @Test
+    fun unknownWriteDoesNotPretendToRollBackAndOnlyResolutionClearsIt() = runBlocking {
+        val queue = RuleSaveQueue(this, persist = { _: Int -> false }, read = { 0 }, keepDraftOnFailure = { true })
+        queue.initialize(0)
+        queue.submit(1)
+        val pending = queue.state.value!!
+        assertEquals(1, pending.value)
+        assertTrue(pending.verificationPending)
+        queue.refresh(0, pending)
+        assertEquals(1, queue.state.value!!.value)
+        queue.resolve(1, pending)
+        assertFalse(queue.state.value!!.verificationPending)
+    }
+
+    @Test
+    fun readExceptionDoesNotStrandTheWorkerOrReplaceTheDraft() = runBlocking {
+        val queue = RuleSaveQueue<Int>(this, persist = { value: Int -> value == 2 },
+            read = { throw IllegalStateException("unreadable") })
+        queue.initialize(0)
+        queue.submit(1)
+        assertEquals(1, queue.state.value!!.value)
+        assertTrue(queue.state.value!!.verificationPending)
+        queue.submit(2)
+        assertFalse(queue.state.value!!.pending)
+        assertFalse(queue.state.value!!.verificationPending)
+    }
+    @Test
     fun verifiedFinalWriteProducesSuccessOnlyAfterItCompletes() = runBlocking {
         withTimeout(3_000) {
             val verified = CompletableDeferred<Boolean>()

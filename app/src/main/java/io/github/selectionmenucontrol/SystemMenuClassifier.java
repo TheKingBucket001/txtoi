@@ -6,7 +6,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ResolveInfo;
-import android.util.Log;
+import android.os.Parcel;
+import android.os.SystemClock;
 import android.view.Menu;
 import android.view.MenuItem;
 
@@ -17,6 +18,8 @@ import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.security.MessageDigest;
+import java.nio.charset.StandardCharsets;
 
 /** Executes the installed ROM's menu policy without launching an activity or touching a window. */
 @SuppressLint({"PrivateApi", "DiscouragedPrivateApi"})
@@ -24,7 +27,6 @@ final class SystemMenuClassifier {
     static final int UNKNOWN = 0;
     static final int ORDINARY = 1;
     static final int FIXED = 2;
-    private static final String TAG = "SelectionMenuControl";
 
     private final Object editor;
     private final Method priority;
@@ -34,7 +36,7 @@ final class SystemMenuClassifier {
     private final Method requiresActionButton;
     private final Constructor<?> newMenu;
     private final Method compareMenuItems;
-    private boolean reportedFailure;
+    private final MenuPolicyCache cache = new MenuPolicyCache();
 
     SystemMenuClassifier() throws ReflectiveOperationException {
         Class<?> editorType = Class.forName("android.widget.IEditorExt");
@@ -109,10 +111,26 @@ final class SystemMenuClassifier {
     }
 
     synchronized Result evaluate(Context context, List<ResolveInfo> originals, boolean forDisplay) {
+        return evaluate(context, originals, forDisplay, 0);
+    }
+
+    synchronized void invalidate() { cache.clear(); }
+
+    synchronized Result evaluate(Context context, List<ResolveInfo> originals, boolean forDisplay, int userId) {
         Map<ResolveInfo, Integer> classifications = new IdentityHashMap<>();
         for (ResolveInfo original : originals) classifications.put(original, UNKNOWN);
-        if (context == null) return new Result(originals, classifications);
+        if (context == null || originals.size() > RuleConfig.MAX_ENTRIES) return new Result(originals, classifications);
+        long started = SystemClock.elapsedRealtime();
         try {
+            String key = cacheKey(context, originals, userId);
+            MenuPolicyCache.Value cached = cache.get(key, started);
+            if (cached != null) {
+                List<ResolveInfo> display = new ArrayList<>(originals.size());
+                for (int index = 0; index < originals.size(); index++) classifications.put(originals.get(index), cached.kinds[index]);
+                for (int index : cached.order) display.add(originals.get(index));
+                ModuleDiagnostics.metric(ModuleDiagnostics.Metric.POLICY_CACHE_HIT, 1);
+                return new Result(forDisplay ? display : originals, classifications);
+            }
             Menu menu = (Menu) newMenu.newInstance(context);
             Map<MenuItem, Entry> entries = new IdentityHashMap<>();
             for (int index = 0; index < originals.size(); index++) {
@@ -146,7 +164,6 @@ final class SystemMenuClassifier {
                 classifications.put(entry.info, entry.handled || (!entry.requiredBefore && requiredAfter) ? FIXED : ORDINARY);
                 ordered.add(entry);
             }
-            if (!forDisplay) return new Result(originals, classifications);
             ordered.sort((left, right) -> {
                 try {
                     return (Integer) compareMenuItems.invoke(null, left.item, right.item);
@@ -156,16 +173,42 @@ final class SystemMenuClassifier {
             });
             List<ResolveInfo> displayOrder = new ArrayList<>(ordered.size());
             for (Entry entry : ordered) displayOrder.add(entry.info);
-            return new Result(displayOrder, classifications);
+            int[] kinds = new int[originals.size()];
+            int[] indices = new int[originals.size()];
+            IdentityHashMap<ResolveInfo, Integer> positions = new IdentityHashMap<>();
+            for (int index = 0; index < originals.size(); index++) {
+                if (positions.put(originals.get(index), index) != null) throw new IllegalStateException("Duplicate input");
+                kinds[index] = classifications.get(originals.get(index));
+            }
+            for (int index = 0; index < displayOrder.size(); index++) indices[index] = positions.get(displayOrder.get(index));
+            cache.put(key, kinds, indices, started);
+            ModuleDiagnostics.recover(ModuleDiagnostics.Code.POLICY_FAILED);
+            return new Result(forDisplay ? displayOrder : originals, classifications);
         } catch (Throwable error) {
             // A partial menu cannot establish trustworthy slots for the settings list.
             for (ResolveInfo original : originals) classifications.put(original, UNKNOWN);
-            if (!reportedFailure) {
-                reportedFailure = true;
-                Log.w(TAG, "Installed menu policy evaluation failed; sorting disabled for unclassified entries", error);
-            }
+            ModuleDiagnostics.fault(ModuleDiagnostics.Code.POLICY_FAILED);
             return new Result(originals, classifications);
+        } finally {
+            ModuleDiagnostics.metric(ModuleDiagnostics.Metric.POLICY_MS, SystemClock.elapsedRealtime() - started);
         }
+    }
+
+    private static String cacheKey(Context context, List<ResolveInfo> originals, int userId) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        digest.update((userId + ":" + context.getResources().getConfiguration()).getBytes(StandardCharsets.UTF_8));
+        Parcel parcel = Parcel.obtain();
+        try {
+            for (ResolveInfo info : originals) {
+                parcel.setDataPosition(0);
+                parcel.setDataSize(0);
+                info.writeToParcel(parcel, 0);
+                byte[] value = parcel.marshall();
+                digest.update(java.nio.ByteBuffer.allocate(4).putInt(value.length).array());
+                digest.update(value);
+            }
+        } finally { parcel.recycle(); }
+        return java.util.Base64.getEncoder().encodeToString(digest.digest());
     }
 
     private Entry addItem(Context context, ResolveInfo original, int index, Menu menu,

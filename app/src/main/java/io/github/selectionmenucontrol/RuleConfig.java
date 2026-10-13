@@ -1,6 +1,7 @@
 package io.github.selectionmenucontrol;
 
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
@@ -18,25 +19,40 @@ import java.util.function.Predicate;
 
 /** Immutable rules shared by the app and system_server. Empty order means system order. */
 class RuleConfig {
+    static final int MAX_ENCODED_LENGTH = 65_536;
+    static final int MAX_ENTRIES = 512;
+    static final int MAX_COMPONENT_LENGTH = 512;
     final Set<String> hiddenComponents;
     final List<String> orderedComponents;
+    private final Map<String, Integer> ranks;
 
     RuleConfig(Set<String> hiddenComponents, List<String> orderedComponents) {
+        if (hiddenComponents.size() > MAX_ENTRIES || orderedComponents.size() > MAX_ENTRIES) {
+            throw new IllegalArgumentException("Too many rule entries");
+        }
         this.hiddenComponents = Collections.unmodifiableSet(new HashSet<>(hiddenComponents));
         this.orderedComponents = Collections.unmodifiableList(
                 new ArrayList<>(new LinkedHashSet<>(orderedComponents)));
+        Map<String, Integer> nextRanks = new HashMap<>();
+        for (int index = 0; index < this.orderedComponents.size(); index++) {
+            nextRanks.put(this.orderedComponents.get(index), index);
+        }
+        ranks = Collections.unmodifiableMap(nextRanks);
     }
 
     String encode() {
         List<String> hidden = new ArrayList<>(hiddenComponents);
         Collections.sort(hidden);
-        return "v3:" + encodeList(hidden) + ":" + encodeList(orderedComponents);
+        String result = "v3:" + encodeList(hidden) + ":" + encodeList(orderedComponents);
+        if (result.length() > MAX_ENCODED_LENGTH) throw new IllegalArgumentException("Rules too large");
+        return result;
     }
 
     static RuleConfig decode(String value) {
         if (value == null) {
             return new RuleConfig(Collections.emptySet(), Collections.emptyList());
         }
+        if (value.length() > MAX_ENCODED_LENGTH) throw new IllegalArgumentException("Rules too large");
         String[] parts = value.split(":", -1);
         if (parts.length == 3 && "v3".equals(parts[0])) {
             return new RuleConfig(new HashSet<>(decodeList(parts[1])), decodeList(parts[2]));
@@ -63,10 +79,6 @@ class RuleConfig {
             }
         }
         if (!orderedComponents.isEmpty()) {
-            Map<String, Integer> ranks = new HashMap<>();
-            for (int index = 0; index < orderedComponents.size(); index++) {
-                ranks.put(orderedComponents.get(index), index);
-            }
             List<T> ordinary = new ArrayList<>();
             boolean[] fixedSlots = new boolean[visible.size()];
             for (int index = 0; index < visible.size(); index++) {
@@ -95,8 +107,17 @@ class RuleConfig {
         for (String component : components) {
             validateComponent(component);
         }
-        return Base64.getEncoder().encodeToString(
-                String.join("\n", components).getBytes(StandardCharsets.UTF_8));
+        try {
+            ByteBuffer encoded = StandardCharsets.UTF_8.newEncoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .encode(CharBuffer.wrap(String.join("\n", components)));
+            byte[] bytes = new byte[encoded.remaining()];
+            encoded.get(bytes);
+            return Base64.getEncoder().encodeToString(bytes);
+        } catch (CharacterCodingException error) {
+            throw new IllegalArgumentException("Invalid rule payload encoding", error);
+        }
     }
 
     private static List<String> decodeList(String encoded) {
@@ -116,12 +137,13 @@ class RuleConfig {
         for (String component : decoded.split("\n", -1)) {
             validateComponent(component);
             components.add(component);
+            if (components.size() > MAX_ENTRIES) throw new IllegalArgumentException("Too many rule entries");
         }
         return components;
     }
 
     private static void validateComponent(String component) {
-        if (component == null) {
+        if (component == null || component.length() > MAX_COMPONENT_LENGTH) {
             throw new IllegalArgumentException("Invalid activity component");
         }
         int slash = component.indexOf('/');

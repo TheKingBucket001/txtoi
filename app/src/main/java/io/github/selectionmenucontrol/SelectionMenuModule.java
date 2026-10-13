@@ -3,12 +3,19 @@ package io.github.selectionmenucontrol;
 import android.annotation.SuppressLint;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.database.ContentObserver;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ResolveInfo;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -24,6 +31,7 @@ import io.github.libxposed.api.XposedModuleInterface;
 @SuppressLint({"PrivateApi", "DiscouragedPrivateApi", "StaticFieldLeak"})
 public final class SelectionMenuModule extends XposedModule {
     private static final long RULE_CACHE_MS = 1500L;
+    private static final LastValidRules<SystemRuleStore.Snapshot> lastValidRules = new LastValidRules<>(30_000L);
     private static volatile SystemRuleStore.Snapshot cachedRules = SystemRuleStore.Snapshot.empty();
     private static volatile long nextRefreshAt;
     private static volatile Context systemContext;
@@ -31,11 +39,16 @@ public final class SelectionMenuModule extends XposedModule {
     private static volatile int moduleAppId = -1;
     private static SystemMenuClassifier menuClassifier;
     private static long nextClassifierAttemptAt;
-    private static boolean reportedClassifierInitializationFailure;
+    private static volatile boolean observersRegistered;
+    private static long nextObserverAttemptAt;
+    private static volatile boolean probePending = true;
+    private static long nextProbePollAt;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         if (param.isSystemServer()) {
+            ModuleDiagnostics.configure((warning, summary) -> log(warning ? android.util.Log.WARN : android.util.Log.INFO,
+                    "SelectionMenuControl", summary));
             log(android.util.Log.INFO, "SelectionMenuControl", "Modern module loaded in system_server; waiting for system class loader");
         }
     }
@@ -54,7 +67,7 @@ public final class SelectionMenuModule extends XposedModule {
             hook(query).intercept(chain -> interceptPublicProcessTextQuery(chain, sliceClass, getList, newSlice));
             log(android.util.Log.INFO, "SelectionMenuControl", "Hooked public PROCESS_TEXT queryIntentActivities boundary");
         } catch (Throwable error) {
-            log(android.util.Log.ERROR, "SelectionMenuControl", "Public PROCESS_TEXT menu query hook not installed", error);
+            ModuleDiagnostics.fault(ModuleDiagnostics.Code.HOOK_LOAD_FAILED);
         }
     }
 
@@ -80,13 +93,15 @@ public final class SelectionMenuModule extends XposedModule {
         if (!processText || !sliceClass.isInstance(result)) {
             return result;
         }
-        boolean originalQuery = isOriginalQuery(intent);
-        SystemRuleStore.Snapshot rules = readRules();
-        if (!originalQuery && (!rules.valid || (rules.hiddenComponents.isEmpty() && rules.orderedComponents.isEmpty()))) {
-            respondToProbe();
-            return result;
-        }
+        long queryStarted = SystemClock.elapsedRealtime();
         try {
+            boolean originalQuery = isOriginalQuery(intent);
+            SystemRuleStore.Snapshot rules = readRules();
+            if (!originalQuery && (!rules.valid || (rules.hiddenComponents.isEmpty() && rules.orderedComponents.isEmpty()))) {
+                respondToProbe(false);
+                ModuleDiagnostics.recover(ModuleDiagnostics.Code.QUERY_FAILED);
+                return result;
+            }
             Object contents = getList.invoke(result);
             if (!(contents instanceof List<?>)) {
                 return result;
@@ -106,7 +121,8 @@ public final class SelectionMenuModule extends XposedModule {
                     Context context = getSystemContext();
                     SystemMenuClassifier classifier = getMenuClassifier();
                     if (classifier != null) {
-                        SystemMenuClassifier.Result policy = classifier.evaluate(context, resolved, originalQuery);
+                        int userId = (Integer) chain.getArgs().get(chain.getArgs().size() - 1);
+                        SystemMenuClassifier.Result policy = classifier.evaluate(contextForUser(context, userId), resolved, originalQuery, userId);
                         classifications = policy.classifications;
                         // Only the module UI receives the system toolbar's display order.
                         // Host queries retain their PM slots before applying ordinary rules.
@@ -130,7 +146,8 @@ public final class SelectionMenuModule extends XposedModule {
                     annotated.add(copy);
                 }
                 Object annotatedResult = newSlice.newInstance(annotated);
-                respondToProbe();
+                ModuleDiagnostics.recover(ModuleDiagnostics.Code.QUERY_FAILED);
+                respondToProbe(true);
                 return annotatedResult;
             }
             Map<ResolveInfo, Integer> effectiveClassifications = classifications;
@@ -139,12 +156,15 @@ public final class SelectionMenuModule extends XposedModule {
             // Keep the original slice and ResolveInfo objects untouched. No internal resolution
             // query is filtered or reordered, including resolveActivity with resolveForStart=false.
             Object effectiveResult = filtered.equals(original) ? result : newSlice.newInstance(filtered);
+            ModuleDiagnostics.recover(ModuleDiagnostics.Code.QUERY_FAILED);
             // Respond only after the original query and any required result replacement succeed.
-            respondToProbe();
+            respondToProbe(false);
             return effectiveResult;
         } catch (Throwable error) {
-            log(android.util.Log.WARN, "SelectionMenuControl", "Public query menu rules failed; original list preserved", error);
+            ModuleDiagnostics.fault(ModuleDiagnostics.Code.QUERY_FAILED);
             return result;
+        } finally {
+            ModuleDiagnostics.metric(ModuleDiagnostics.Metric.QUERY_MS, SystemClock.elapsedRealtime() - queryStarted);
         }
     }
 
@@ -153,12 +173,9 @@ public final class SelectionMenuModule extends XposedModule {
             nextClassifierAttemptAt = SystemClock.elapsedRealtime() + 5_000L;
             try {
                 menuClassifier = new SystemMenuClassifier();
-                android.util.Log.i("SelectionMenuControl", "Installed ROM menu policy classifier ready");
+                ModuleDiagnostics.recover(ModuleDiagnostics.Code.POLICY_UNAVAILABLE);
             } catch (Throwable error) {
-                if (!reportedClassifierInitializationFailure) {
-                    reportedClassifierInitializationFailure = true;
-                    android.util.Log.w("SelectionMenuControl", "Installed ROM menu policy unavailable; hiding remains active, will retry", error);
-                }
+                ModuleDiagnostics.fault(ModuleDiagnostics.Code.POLICY_UNAVAILABLE);
             }
         }
         return menuClassifier;
@@ -194,25 +211,38 @@ public final class SelectionMenuModule extends XposedModule {
     private static SystemRuleStore.Snapshot readRules() {
         long now = SystemClock.elapsedRealtime();
         if (now < nextRefreshAt) {
+            ModuleDiagnostics.metric(ModuleDiagnostics.Metric.RULE_CACHE_HIT, 1);
             return cachedRules;
         }
         synchronized (SelectionMenuModule.class) {
             if (now < nextRefreshAt) {
                 return cachedRules;
             }
-            cachedRules = queryRules();
+            SystemRuleStore.Snapshot observed = queryRules();
+            cachedRules = lastValidRules.accept(observed, observed.valid, now);
+            // Notifications can be delayed by a busy system main thread. Keep the bounded
+            // fallback even after registration, rather than extending stale rules to 30 seconds.
             nextRefreshAt = now + RULE_CACHE_MS;
+            if (cachedRules != observed) nextRefreshAt = Math.min(nextRefreshAt, lastValidRules.expiresAt());
             return cachedRules;
         }
     }
 
     private static SystemRuleStore.Snapshot queryRules() {
         Context context = getSystemContext();
-        return context == null ? SystemRuleStore.Snapshot.empty() : SystemRuleStore.read(context);
+        if (context == null) return SystemRuleStore.Snapshot.unavailable(SystemRuleStore.ReadStatus.UNREADABLE);
+        registerObservers(context);
+        return SystemRuleStore.read(context);
     }
 
-    private void respondToProbe() {
+    private void respondToProbe(boolean trustedOriginalQuery) {
         synchronized (SelectionMenuModule.class) {
+            long now = SystemClock.elapsedRealtime();
+            // Only the verified module caller bypasses polling. Its environment check must
+            // not depend on delivery of a ContentObserver callback on the system main thread.
+            if (!trustedOriginalQuery && !probePending && now < nextProbePollAt) return;
+            nextProbePollAt = now + (observersRegistered ? 30_000L : RULE_CACHE_MS);
+            probePending = false;
             Context context = getSystemContext();
             if (context != null) {
                 String nonce = SystemRuleStore.respondToProbe(context, lastRespondedProbeNonce);
@@ -221,6 +251,66 @@ public final class SelectionMenuModule extends XposedModule {
                 }
             }
         }
+    }
+
+    private static void invalidatePolicy() {
+        synchronized (SelectionMenuModule.class) {
+            if (menuClassifier != null) menuClassifier.invalidate();
+            moduleAppId = -1;
+        }
+        ModuleDiagnostics.event(ModuleDiagnostics.Code.CACHE_INVALIDATED, 0, 0);
+    }
+
+    private static void registerObservers(Context context) {
+        long now = SystemClock.elapsedRealtime();
+        if (observersRegistered || now < nextObserverAttemptAt) return;
+        nextObserverAttemptAt = now + 30_000L;
+        if (Looper.getMainLooper() == null) return;
+        long identity = Binder.clearCallingIdentity();
+        ContentObserver observer = new ContentObserver(new Handler(Looper.getMainLooper())) {
+            @Override public void onChange(boolean selfChange, android.net.Uri uri) {
+                synchronized (SelectionMenuModule.class) {
+                    if (Settings.Global.getUriFor(SystemRuleStore.PROBE_REQUEST_KEY).equals(uri)) probePending = true;
+                    else nextRefreshAt = 0;
+                }
+            }
+        };
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context ignored, Intent intent) { invalidatePolicy(); }
+        };
+        try {
+            context.getContentResolver().registerContentObserver(Settings.Global.getUriFor(SystemRuleStore.SETTING_KEY), false, observer);
+            context.getContentResolver().registerContentObserver(Settings.Global.getUriFor(SystemRuleStore.PROBE_REQUEST_KEY), false, observer);
+            IntentFilter packages = new IntentFilter();
+            packages.addAction(Intent.ACTION_PACKAGE_ADDED);
+            packages.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            packages.addAction(Intent.ACTION_PACKAGE_CHANGED);
+            packages.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            packages.addDataScheme("package");
+            registerSystemReceiver(context, receiver, packages);
+            IntentFilter configuration = new IntentFilter(Intent.ACTION_CONFIGURATION_CHANGED);
+            configuration.addAction("android.intent.action.USER_SWITCHED");
+            registerSystemReceiver(context, receiver, configuration);
+            observersRegistered = true;
+        } catch (Exception error) {
+            // Undo partial registration before a bounded retry, rather than duplicating listeners.
+            try { context.getContentResolver().unregisterContentObserver(observer); } catch (Exception ignored) { }
+            try { context.unregisterReceiver(receiver); } catch (IllegalArgumentException ignored) { }
+            ModuleDiagnostics.fault(ModuleDiagnostics.Code.RULES_READ_FAILED);
+        } finally { Binder.restoreCallingIdentity(identity); }
+    }
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag") // Before API 33 these protected system broadcasts use the legacy overload.
+    private static void registerSystemReceiver(Context context, BroadcastReceiver receiver, IntentFilter filter) {
+        if (Build.VERSION.SDK_INT >= 33) context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        else context.registerReceiver(receiver, filter);
+    }
+
+    private static Context contextForUser(Context context, int userId) throws ReflectiveOperationException {
+        if (context == null || userId == 0) return context;
+        Class<?> userType = Class.forName("android.os.UserHandle");
+        Object user = userType.getMethod("of", int.class).invoke(null, userId);
+        return (Context) Context.class.getMethod("createContextAsUser", userType, int.class).invoke(context, user, 0);
     }
 
     private static Context getSystemContext() {

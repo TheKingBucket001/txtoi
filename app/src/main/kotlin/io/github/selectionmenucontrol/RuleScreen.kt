@@ -1,9 +1,12 @@
 package io.github.selectionmenucontrol
 
 import android.content.ComponentName
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.util.Log
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -12,21 +15,26 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
@@ -41,6 +49,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,6 +59,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -62,14 +72,10 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
-import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
-import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.onClick
-import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.toggleableState
-import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
@@ -77,6 +83,8 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -99,6 +107,26 @@ internal data class Processor(
     val classificationKnown: Boolean,
 )
 
+internal class RuleMovementIndex private constructor(
+    val source: List<Processor>,
+    val hidden: Set<String>,
+    val components: List<String>,
+    val positions: Map<String, Int>,
+    val displayedPositions: Map<String, Int>,
+) {
+    val keys: Set<String> get() = positions.keys
+
+    companion object {
+        fun create(processors: List<Processor>, hidden: Set<String>): RuleMovementIndex {
+            val moving = processors.filter { it.classificationKnown && !it.fixed && it.component !in hidden }
+                .map { it.component }
+            return RuleMovementIndex(processors, hidden, moving,
+                moving.withIndex().associate { it.value to it.index },
+                processors.withIndex().associate { it.value.component to it.index })
+        }
+    }
+}
+
 private data class RuleScreenData(
     val snapshot: SystemRuleStore.Snapshot,
     val processors: List<Processor>,
@@ -112,6 +140,7 @@ private data class RuleDragSession(
     val grabOffset: Float,
     val pointerY: Float,
     val startOrder: List<String>,
+    val startRules: SystemRuleStore.Snapshot,
 )
 
 private data class RuleDragCallbacks(
@@ -126,6 +155,7 @@ private enum class RestoreAction { HIDDEN, ORDER }
 internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     val editor = remember(activity) { ViewModelProvider(activity)[RuleEditorViewModel::class.java] }
     val saveState by editor.state.collectAsState()
+    val recoveryChecking by editor.checking.collectAsState()
     val emptySnapshot = remember { SystemRuleStore.Snapshot.empty() }
     val snapshot = saveState?.value ?: emptySnapshot
     var originalProcessors by remember { mutableStateOf(emptyList<Processor>()) }
@@ -136,11 +166,14 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     var dragSession by remember { mutableStateOf<RuleDragSession?>(null) }
     var dragToken by remember { mutableIntStateOf(0) }
     var optionSize by remember { mutableStateOf(IntSize.Zero) }
-    var restoreAction by remember { mutableStateOf<RestoreAction?>(null) }
+    var restoreAction by rememberSaveable { mutableStateOf<RestoreAction?>(null) }
+    val movement = remember(displayedProcessors, snapshot.hiddenComponents) {
+        RuleMovementIndex.create(displayedProcessors, snapshot.hiddenComponents)
+    }
     val listState = rememberLazyListState()
     val density = LocalDensity.current
     val windowFocused = LocalWindowInfo.current.isWindowFocused
-    val canChange = !initializing && initializationError == null && snapshot.valid
+    val canChange = !initializing && !recoveryChecking && initializationError == null && snapshot.valid && saveState?.verificationPending != true
     val canUseActions = canChange && dragSession == null
     val gripStart = with(density) { 16.dp.toPx() }
     val gripEnd = with(density) { 64.dp.toPx() }
@@ -151,6 +184,10 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     fun movable(processor: Processor, hidden: Set<String> = snapshot.hiddenComponents) =
         processor.classificationKnown && !processor.fixed && processor.component !in hidden
 
+    fun movementFor(hidden: Set<String>): RuleMovementIndex =
+        if (movement.source === displayedProcessors && movement.hidden == hidden) movement
+        else RuleMovementIndex.create(displayedProcessors, hidden)
+
     fun cancelDrag() {
         val current = dragSession ?: return
         dragSession = null
@@ -158,94 +195,183 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         displayedProcessors = current.startOrder.mapNotNull(byComponent::get)
     }
 
+    fun synchronizePresentation() {
+        cancelDrag()
+        val latest = editor.state.value?.value?.takeIf { it.valid } ?: return
+        displayedProcessors = applyOrder(originalProcessors, latest.orderedComponents)
+    }
+
+    fun dragRulesUnchanged(start: SystemRuleStore.Snapshot): Boolean {
+        val latest = editor.state.value ?: return false
+        return !editor.checking.value && !latest.verificationPending && latest.value.valid
+            && latest.value.hiddenComponents == start.hiddenComponents
+            && latest.value.orderedComponents == start.orderedComponents
+    }
+
+    val refreshPackages by rememberUpdatedState { loadSignal++ }
+    val cancelCurrentDrag by rememberUpdatedState(::cancelDrag)
+    DisposableEffect(activity) {
+        var skipInitialResume = activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    if (skipInitialResume) skipInitialResume = false else refreshPackages()
+                }
+                Lifecycle.Event.ON_STOP -> cancelCurrentDrag()
+                else -> Unit
+            }
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) refreshPackages()
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addDataScheme("package")
+        }
+        if (Build.VERSION.SDK_INT >= 33) activity.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        else {
+            activity.registerReceiver(receiver, filter)
+        }
+        activity.lifecycle.addObserver(observer)
+        onDispose {
+            activity.lifecycle.removeObserver(observer)
+            activity.unregisterReceiver(receiver)
+        }
+    }
+
     LaunchedEffect(loadSignal) {
         cancelDrag()
+        if (loadSignal != 0) delay(150) // Coalesce replace/remove/add broadcasts into one read.
         initializing = true
         initializationError = null
         val beforeLoad = editor.state.value
         val result = withContext(Dispatchers.IO) {
-            val draft = beforeLoad?.takeIf { it.pending }?.value?.takeIf { it.valid }
-            val current = draft ?: SystemRuleStore.readApp(activity)
-            when {
-                !current.valid -> RuleScreenData(current, emptyList(), "规则数据无法读取，请恢复备份后重试")
-                draft == null && !SystemRuleStore.migrateToGlobal(activity, current) ->
-                    RuleScreenData(current, emptyList(), "规则迁移失败，请确认 Root 授权后重试")
-                else -> try {
-                    val migrated = draft ?: SystemRuleStore.readApp(activity)
-                    if (!migrated.valid) {
-                        RuleScreenData(migrated, emptyList(), "规则数据无法读取，请恢复备份后重试")
-                    } else {
-                        RuleScreenData(migrated, loadProcessors(activity, migrated.hiddenComponents))
+            try {
+                val draft = beforeLoad?.takeIf { it.pending && !it.verificationPending }?.value?.takeIf { it.valid }
+                val current = draft ?: SystemRuleStore.readApp(activity)
+                when {
+                    !current.valid -> RuleScreenData(current, emptyList(), "无法读取设置，请重新读取")
+                    draft == null && !SystemRuleStore.migrateToGlobal(activity, current) ->
+                        RuleScreenData(current, emptyList(), "无法载入设置，请确认 Root 授权后重试")
+                    else -> try {
+                        val migrated = draft ?: SystemRuleStore.readApp(activity)
+                        if (!migrated.valid) {
+                            RuleScreenData(migrated, emptyList(), "无法读取设置，请重新读取")
+                        } else {
+                            RuleScreenData(migrated, loadProcessors(activity, migrated.hiddenComponents))
+                        }
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        ModuleDiagnostics.fault(ModuleDiagnostics.Code.QUERY_FAILED)
+                        RuleScreenData(current, emptyList(), "读取选项失败，请重试")
                     }
-                } catch (error: Exception) {
-                    if (error is CancellationException) throw error
-                    Log.e("SelectionMenuControl", "Cannot load PROCESS_TEXT activities", error)
-                    RuleScreenData(current, emptyList(), "读取扩展项失败，请重试")
                 }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                ModuleDiagnostics.fault(ModuleDiagnostics.Code.RULES_READ_FAILED)
+                RuleScreenData(beforeLoad?.value ?: emptySnapshot, emptyList(), "读取设置失败，请重新读取")
             }
         }
         if (result.error == null && result.snapshot.valid) editor.initialize(activity, result.snapshot, beforeLoad)
+        if (result.error == null) ModuleDiagnostics.recover(ModuleDiagnostics.Code.QUERY_FAILED)
         originalProcessors = result.processors
         displayedProcessors = applyOrder(result.processors, editor.state.value?.value?.orderedComponents ?: result.snapshot.orderedComponents)
         initializationError = result.error
         initializing = false
     }
 
-    LaunchedEffect(saveState?.failureVersion) {
+    // Saved-state replay and external refresh can update the editor after the page has loaded.
+    // Preview moves change displayedProcessors only, so they never trigger this effect.
+    LaunchedEffect(originalProcessors, saveState?.value?.orderedComponents,
+        saveState?.value?.hiddenComponents, initializing, initializationError) {
+        if (!initializing && initializationError == null) synchronizePresentation()
+    }
+
+    LaunchedEffect(saveState?.failureVersion, loadSignal) {
+        if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return@LaunchedEffect
         if (editor.consumeFailure()) {
             dragSession = null
-            val actual = editor.state.value?.value ?: return@LaunchedEffect
+            val result = editor.state.value ?: return@LaunchedEffect
+            val actual = result.value
             displayedProcessors = applyOrder(originalProcessors, actual.orderedComponents)
-            if (!actual.valid) initializationError = "规则数据无法读取，请恢复备份后重试"
-            Toast.makeText(activity, "保存失败，已重新读取当前规则", Toast.LENGTH_LONG).show()
+            if (!actual.valid) initializationError = "无法读取设置，请重新核对"
+            Toast.makeText(activity,
+                when {
+                    result.verificationPending -> "保存结果待确认，请重新核对"
+                    !actual.valid -> "保存未完成，暂时无法读取设置"
+                    else -> "保存未完成，已核对当前设置"
+                }, Toast.LENGTH_LONG).show()
         }
     }
 
-    LaunchedEffect(saveState?.successVersion, saveState?.pending) {
+    LaunchedEffect(saveState?.successVersion, saveState?.pending, saveState?.verificationPending, loadSignal) {
         if (saveState?.pending != false) return@LaunchedEffect
         delay(250)
-        if (editor.state.value?.pending == false && editor.consumeSuccess()) {
+        if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+            && editor.state.value?.pending == false && editor.state.value?.verificationPending == false
+            && editor.consumeSuccess()) {
             Toast.makeText(activity, "已保存", Toast.LENGTH_SHORT).show()
         }
     }
 
-    fun save(next: SystemRuleStore.Snapshot) {
-        if (initializing || initializationError != null || editor.state.value?.value?.valid != true || dragSession != null) return
-        displayedProcessors = applyOrder(originalProcessors, next.orderedComponents)
-        editor.save(next)
+    fun createAndSave(hidden: Set<String>, order: List<String>): Boolean {
+        if (initializing || editor.checking.value || initializationError != null || editor.state.value?.value?.valid != true
+            || editor.state.value?.verificationPending == true || dragSession != null) {
+            synchronizePresentation()
+            return false
+        }
+        return try {
+            val next = SystemRuleStore.Snapshot(hidden, order)
+            next.encode() // Validate the encoded size before changing presentation or submitting IO.
+            displayedProcessors = applyOrder(originalProcessors, next.orderedComponents)
+            editor.save(next)
+            true
+        } catch (_: IllegalArgumentException) {
+            synchronizePresentation()
+            ModuleDiagnostics.fault(ModuleDiagnostics.Code.RULES_LIMIT_EXCEEDED)
+            Toast.makeText(activity, "设置过多或内容过长，本次更改未保存", Toast.LENGTH_LONG).show()
+            false
+        }
     }
 
-    fun saveOrder() {
-        val current = editor.state.value?.value ?: return
+    fun saveOrder(): Boolean {
+        val current = editor.state.value?.value ?: return false
         val fixed = originalProcessors.filter { it.fixed }.mapTo(HashSet()) { it.component }
         val ordered = mergeOrder(current.orderedComponents, displayedProcessors.map { it.component }, fixed)
-        save(SystemRuleStore.Snapshot(current.hiddenComponents, ordered))
+        return createAndSave(current.hiddenComponents, ordered)
     }
 
     fun changeHidden(component: String) {
-        if (initializing || dragSession != null || initializationError != null) return
+        if (initializing || editor.checking.value || dragSession != null || initializationError != null || editor.state.value?.verificationPending == true) return
         val current = editor.state.value?.value ?: return
         if (!current.valid) return
         val hidden = current.hiddenComponents.toMutableSet()
         if (!hidden.add(component)) hidden.remove(component)
-        save(SystemRuleStore.Snapshot(hidden, current.orderedComponents))
+        createAndSave(hidden, current.orderedComponents)
     }
 
     fun moveOne(component: String, direction: Int): Boolean {
-        if (initializing || dragSession != null || initializationError != null) return false
+        if (initializing || editor.checking.value || dragSession != null || initializationError != null || editor.state.value?.verificationPending == true) return false
         val current = editor.state.value?.value?.takeIf { it.valid } ?: return false
-        val moving = displayedProcessors.filter { movable(it, current.hiddenComponents) }
-        val from = moving.indexOfFirst { it.component == component }
+        displayedProcessors = applyOrder(originalProcessors, current.orderedComponents)
+        val currentMovement = movementFor(current.hiddenComponents)
+        val moving = currentMovement.components
+        val from = currentMovement.positions[component] ?: return false
         val to = from + direction
         if (from < 0 || to !in moving.indices) return false
-        displayedProcessors = moveVisibleProcessors(displayedProcessors, current.hiddenComponents, component, moving[to].component)
-        saveOrder()
-        return true
+        displayedProcessors = moveVisibleProcessors(displayedProcessors, current.hiddenComponents, component, moving[to])
+        return saveOrder()
     }
 
     fun finishDrag(commit: Boolean) {
         val current = dragSession ?: return
         if (!commit) { cancelDrag(); return }
+        if (!dragRulesUnchanged(current.startRules)) { synchronizePresentation(); return }
         dragSession = null
         if (current.startOrder != displayedProcessors.map { it.component }) saveOrder()
     }
@@ -258,13 +384,19 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                 position.y >= it.offset + rowGap && position.y <= it.offset + it.size - rowGap
             } ?: return@start false
             val processor = displayedProcessors.getOrNull(item.index)?.takeIf { it.component == item.key } ?: return@start false
+            if (editor.state.value?.verificationPending == true) return@start false
             val current = editor.state.value?.value?.takeIf { it.valid } ?: return@start false
+            val actualPresentation = applyOrder(originalProcessors, current.orderedComponents)
+            if (actualPresentation != displayedProcessors) {
+                displayedProcessors = actualPresentation
+                return@start true // Absorb a stale grip gesture; its layout belongs to the previous order.
+            }
             if (!movable(processor, current.hiddenComponents)) return@start false
             val bounds = optionBounds(listState, displayedProcessors.size)
             val grabOffset = position.y - item.offset
             if (RuleDragGeometry.top(position.y, grabOffset, item.size.toFloat(), bounds) == null) return@start false
             dragSession = RuleDragSession(++dragToken, processor.component, item.size.toFloat(), grabOffset, position.y,
-                displayedProcessors.map { it.component })
+                displayedProcessors.map { it.component }, current)
             true
         },
         move = { pointerY -> dragSession = dragSession?.copy(pointerY = pointerY) },
@@ -280,13 +412,14 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
             val displayed = displayedProcessors
             val bounds = optionBounds(listState, displayed.size)
             val top = RuleDragGeometry.top(active.pointerY, active.grabOffset, active.height, bounds)
-            if (top == null || !canChange) {
-                cancelDrag()
+            if (top == null || !canChange || !dragRulesUnchanged(active.startRules)) {
+                synchronizePresentation()
                 0f
             } else {
-                val sourceIndex = displayed.indexOfFirst { it.component == active.component }
                 val hidden = editor.state.value?.value?.hiddenComponents ?: snapshot.hiddenComponents
-                val movingKeys = displayed.filter { movable(it, hidden) }.mapTo(HashSet()) { it.component }
+                val frameMovement = movementFor(hidden)
+                val sourceIndex = frameMovement.displayedPositions[active.component] ?: -1
+                val movingKeys = frameMovement.keys
                 // A layout predating a reorder must not become another insertion decision.
                 val visibleItems = listState.layoutInfo.visibleItemsInfo
                 val layoutMatches = visibleItems.all { displayed.getOrNull(it.index)?.component == it.key }
@@ -330,171 +463,189 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     DisposableEffect(Unit) { onDispose { dragSession = null } }
     BackHandler(enabled = initializing || dragSession != null) { cancelDrag() }
 
-    Column(
+    BoxWithConstraints(
         modifier = Modifier.fillMaxSize().background(MiuixTheme.colorScheme.background)
-            .statusBarsPadding().navigationBarsPadding(),
+            .safeDrawingPadding(),
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp, top = 12.dp, bottom = 16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("文本选择菜单", fontSize = 26.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                IconButton(onClick = onAbout, enabled = canUseActions) {
-                    Image(painterResource(R.drawable.ic_info), "关于", modifier = Modifier.size(24.dp))
-                }
-            }
-            Text("勾选隐藏 · 拖动排序 · 自动保存", modifier = Modifier.padding(top = 4.dp),
-                fontSize = 13.sp, color = MiuixTheme.colorScheme.onBackgroundVariant)
-            if (originalProcessors.isNotEmpty()) {
-                Text(
-                    if (originalProcessors.any { !it.classificationKnown }) "部分选项排序检测不可用；仍可设置隐藏。"
-                    else "锁定项由系统安排位置，隐藏项取消勾选后可移动。",
-                    modifier = Modifier.padding(top = 5.dp), fontSize = 11.sp, lineHeight = 16.sp,
-                    color = MiuixTheme.colorScheme.onBackgroundVariant,
-                )
-            }
-        }
-
-        Box(
-            modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds()
-                .onSizeChanged {
-                    if (optionSize != it) cancelDrag()
-                    optionSize = it
-                }
-                .pointerInput(listState) {
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                        if (!dragCallbacks.start(down.position)) return@awaitEachGesture
-                        down.consume()
-                        var commit = false
-                        try {
-                            while (true) {
-                                val event = awaitPointerEvent(PointerEventPass.Initial)
-                                val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
-                                if (event.changes.any { it.id != down.id && it.pressed }) {
-                                    event.changes.forEach { it.consume() }
-                                    break
-                                }
-                                if (!pointer.pressed) {
-                                    // Compose synthesises an already-consumed UP on ACTION_CANCEL.
-                                    // Only an unconsumed, real UP commits the preview.
-                                    commit = pointer.changedToUp()
-                                    if (commit) {
-                                        dragCallbacks.move(pointer.position.y)
-                                        dragFrame()
-                                    }
-                                    pointer.consume()
-                                    break
-                                }
-                                dragCallbacks.move(pointer.position.y)
-                                pointer.consume()
-                            }
-                        } finally {
-                            dragCallbacks.finish(commit)
-                        }
+        val sectionLimit = maxHeight * 0.3f
+        val stackActions = maxWidth < 360.dp || density.fontScale > 1.3f
+        Column(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxWidth().heightIn(max = sectionLimit)
+                .verticalScroll(rememberScrollState()).padding(start = 24.dp, end = 16.dp, top = 12.dp, bottom = 12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("文本选择菜单", fontSize = 26.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    IconButton(onClick = onAbout, enabled = !initializing && dragSession == null) {
+                        Image(painterResource(R.drawable.ic_info), "关于", modifier = Modifier.size(24.dp),
+                            colorFilter = ColorFilter.tint(MiuixTheme.colorScheme.onBackground))
                     }
-                },
-        ) {
-            if (initializing || initializationError != null || originalProcessors.isEmpty()) {
-                Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                }
+                Text("勾选隐藏 · 拖动排序 · 自动保存", modifier = Modifier.padding(top = 4.dp),
+                    fontSize = 13.sp, color = MiuixTheme.colorScheme.onBackgroundVariant)
+                if (saveState?.verificationPending == true) {
+                    TextButton(text = "保存结果待核对 · 重新核对", onClick = { loadSignal++ }, enabled = !initializing,
+                        modifier = Modifier.fillMaxWidth())
+                }
+                if (originalProcessors.isNotEmpty()) {
                     Text(
-                        when {
-                            initializing -> "正在读取系统扩展项…"
-                            initializationError != null -> initializationError!!
-                            else -> "当前没有可配置的文字处理扩展项"
-                        },
-                        modifier = Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2,
+                        if (originalProcessors.any { !it.classificationKnown }) "部分位置无法识别，仍可隐藏。"
+                        else "锁定项位置由系统决定；隐藏项需先取消勾选再移动。",
+                        modifier = Modifier.padding(top = 5.dp), fontSize = 11.sp, lineHeight = 16.sp,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
                     )
-                    if (!initializing && initializationError != null) {
-                        TextButton(text = "重新读取", onClick = { loadSignal++ }, modifier = Modifier.fillMaxWidth())
-                    }
                 }
-            } else {
-                LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                    items(displayedProcessors, key = { it.component }) { processor ->
-                        val hidden = processor.component in snapshot.hiddenComponents
-                        val lockedReason = when {
-                            processor.fixed -> "位置由系统固定，不能移动"
-                            !processor.classificationKnown -> "排序检测不可用"
-                            hidden -> "已隐藏，取消隐藏后可移动"
-                            else -> null
+            }
+
+            Box(
+                modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds()
+                    .onSizeChanged {
+                        if (optionSize != it) cancelDrag()
+                        optionSize = it
+                    }
+                    .pointerInput(listState) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            if (!dragCallbacks.start(down.position)) return@awaitEachGesture
+                            down.consume()
+                            var commit = false
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    if (event.changes.any { it.id != down.id && it.pressed }) {
+                                        event.changes.forEach { it.consume() }
+                                        break
+                                    }
+                                    if (!pointer.pressed) {
+                                        // Compose synthesises an already-consumed UP on ACTION_CANCEL.
+                                        // Only an unconsumed, real UP commits the preview.
+                                        commit = pointer.changedToUp()
+                                        if (commit) {
+                                            dragCallbacks.move(pointer.position.y)
+                                            dragFrame()
+                                        }
+                                        pointer.consume()
+                                        break
+                                    }
+                                    dragCallbacks.move(pointer.position.y)
+                                    pointer.consume()
+                                }
+                            } finally {
+                                dragCallbacks.finish(commit)
+                            }
                         }
-                        val moving = displayedProcessors.filter { movable(it) }
-                        val index = moving.indexOfFirst { it.component == processor.component }
-                        val actions = if (canUseActions && movable(processor)) buildList {
-                            if (index > 0) add(CustomAccessibilityAction("上移") { moveOne(processor.component, -1) })
-                            if (index >= 0 && index < moving.lastIndex) add(CustomAccessibilityAction("下移") { moveOne(processor.component, 1) })
-                        } else emptyList()
-                        val isPlaceholder = dragSession?.component == processor.component
-                        ProcessorRuleRow(
-                            processor = processor, hidden = hidden, enabled = canChange,
-                            handleEnabled = canChange && lockedReason == null, lockedReason = lockedReason,
-                            accessibilityActions = actions, interactive = !isPlaceholder,
-                            modifier = if (isPlaceholder) Modifier.alpha(0f).clearAndSetSemantics { } else Modifier,
-                            onCheckedChange = { changeHidden(processor.component) },
+                    },
+            ) {
+                if ((initializing && originalProcessors.isEmpty()) || initializationError != null || originalProcessors.isEmpty()) {
+                    Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                        Text(
+                            when {
+                                initializing -> "正在读取系统扩展项…"
+                                initializationError != null -> initializationError!!
+                                else -> "当前没有可配置的文字处理扩展项"
+                            },
+                            modifier = Modifier.padding(16.dp), style = MiuixTheme.textStyles.body2,
                         )
+                        if (!initializing && initializationError != null) {
+                            TextButton(text = "重新读取", onClick = { loadSignal++ }, modifier = Modifier.fillMaxWidth())
+                        }
                     }
-                }
-                dragSession?.let { active ->
-                    val processor = displayedProcessors.firstOrNull { it.component == active.component }
-                    val top = RuleDragGeometry.top(active.pointerY, active.grabOffset, active.height,
-                        optionBounds(listState, displayedProcessors.size))
-                    if (processor != null && top != null) {
-                        ProcessorRuleRow(
-                            processor = processor, hidden = processor.component in snapshot.hiddenComponents,
-                            enabled = true, handleEnabled = true, interactive = false, isDragging = true,
-                            modifier = Modifier.fillMaxWidth()
-                                .offset { IntOffset(0, overlayPixelTop(top, active.height,
-                                    optionBounds(listState, displayedProcessors.size))) }
-                                .height(with(density) { active.height.toDp() }).clearAndSetSemantics { },
-                            onCheckedChange = { },
-                        )
+                } else {
+                    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                        items(displayedProcessors, key = { it.component }) { processor ->
+                            val hidden = processor.component in snapshot.hiddenComponents
+                            val lockedReason = when {
+                                processor.fixed -> "位置由系统固定，不能移动"
+                                !processor.classificationKnown -> "排序检测不可用"
+                                hidden -> "已隐藏，取消隐藏后可移动"
+                                else -> null
+                            }
+                            val index = movement.positions[processor.component] ?: -1
+                            val actions = if (canUseActions && movable(processor)) buildList {
+                                if (index > 0) add(CustomAccessibilityAction("上移") { moveOne(processor.component, -1) })
+                                if (index >= 0 && index < movement.components.lastIndex) add(CustomAccessibilityAction("下移") { moveOne(processor.component, 1) })
+                            } else emptyList()
+                            val isPlaceholder = dragSession?.component == processor.component
+                            ProcessorRuleRow(
+                                processor = processor, hidden = hidden, enabled = canChange,
+                                handleEnabled = canChange && lockedReason == null, lockedReason = lockedReason,
+                                accessibilityActions = actions, interactive = !isPlaceholder,
+                                modifier = if (isPlaceholder) Modifier.alpha(0f).clearAndSetSemantics { } else Modifier,
+                                onCheckedChange = { changeHidden(processor.component) },
+                            )
+                        }
+                    }
+                    dragSession?.let { active ->
+                        val processor = displayedProcessors.firstOrNull { it.component == active.component }
+                        val top = RuleDragGeometry.top(active.pointerY, active.grabOffset, active.height,
+                            optionBounds(listState, displayedProcessors.size))
+                        if (processor != null && top != null) {
+                            ProcessorRuleRow(
+                                processor = processor, hidden = processor.component in snapshot.hiddenComponents,
+                                enabled = true, handleEnabled = true, interactive = false, isDragging = true,
+                                modifier = Modifier.fillMaxWidth()
+                                    .offset { IntOffset(0, overlayPixelTop(top, active.height,
+                                        optionBounds(listState, displayedProcessors.size))) }
+                                    .height(with(density) { active.height.toDp() }).clearAndSetSemantics { },
+                                onCheckedChange = { },
+                            )
+                        }
                     }
                 }
             }
-        }
 
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            TextButton(
-                text = "恢复默认排序", onClick = { restoreAction = RestoreAction.ORDER },
-                enabled = canUseActions && snapshot.orderedComponents.isNotEmpty(),
-                modifier = Modifier.weight(1f), colors = ButtonDefaults.textButtonColorsPrimary(),
-            )
-            TextButton(
-                text = "恢复全部显示", onClick = { restoreAction = RestoreAction.HIDDEN },
-                enabled = canUseActions && snapshot.hiddenComponents.isNotEmpty(), modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.textButtonColors(
-                    textColor = Color(0xFFD14343), disabledTextColor = Color(0xFFD14343).copy(alpha = 0.4f),
-                ),
-            )
+            Box(modifier = Modifier.fillMaxWidth().heightIn(max = sectionLimit)
+                .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 10.dp)) {
+                RestoreButtons(stackActions,
+                    canUseActions && snapshot.orderedComponents.isNotEmpty(),
+                    canUseActions && snapshot.hiddenComponents.isNotEmpty(),
+                    { restoreAction = RestoreAction.ORDER }, { restoreAction = RestoreAction.HIDDEN })
+            }
         }
     }
 
     restoreAction?.let { action ->
         val restoringOrder = action == RestoreAction.ORDER
         WindowDialog(show = true, onDismissRequest = { restoreAction = null }, content = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(modifier = Modifier.dialogContent(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (restoringOrder) "恢复默认排序" else "恢复全部显示", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Text(
                     if (restoringOrder) "将清除扩展项的自定义排序，隐藏设置保持不变。"
                     else "将清除隐藏规则，当前排序保持不变。",
                     fontSize = 14.sp, lineHeight = 20.sp,
                 )
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    TextButton(text = "取消", onClick = { restoreAction = null }, modifier = Modifier.weight(1f))
-                    TextButton(
-                        text = "确认恢复", modifier = Modifier.weight(1f), colors = ButtonDefaults.textButtonColorsPrimary(),
-                        onClick = {
-                            restoreAction = null
-                            val current = editor.state.value?.value ?: return@TextButton
-                            if (restoringOrder) save(SystemRuleStore.Snapshot(current.hiddenComponents, emptyList()))
-                            else save(SystemRuleStore.Snapshot(emptySet(), current.orderedComponents))
-                        },
-                    )
-                }
+                DialogActions("取消", { restoreAction = null }, "确认恢复", {
+                    restoreAction = null
+                    editor.state.value?.value?.let { current ->
+                        if (restoringOrder) createAndSave(current.hiddenComponents, emptyList())
+                        else createAndSave(emptySet(), current.orderedComponents)
+                    }
+                }, confirmEnabled = canUseActions)
             }
         })
+    }
+}
+
+@Composable
+private fun RestoreButtons(
+    stacked: Boolean, orderEnabled: Boolean, hiddenEnabled: Boolean,
+    onOrder: () -> Unit, onHidden: () -> Unit,
+) {
+    @Composable fun Order(modifier: Modifier) {
+        TextButton(text = "恢复默认排序", onClick = onOrder, enabled = orderEnabled,
+            modifier = modifier, colors = ButtonDefaults.textButtonColorsPrimary())
+    }
+    @Composable fun Hidden(modifier: Modifier) {
+        TextButton(text = "恢复全部显示", onClick = onHidden, enabled = hiddenEnabled,
+            modifier = modifier, colors = ButtonDefaults.textButtonColors(
+                textColor = MiuixTheme.colorScheme.error,
+                disabledTextColor = MiuixTheme.colorScheme.error.copy(alpha = 0.4f)))
+    }
+    if (stacked) Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Order(Modifier.fillMaxWidth())
+        Hidden(Modifier.fillMaxWidth())
+    } else Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Order(Modifier.weight(1f))
+        Hidden(Modifier.weight(1f))
     }
 }
 
@@ -528,29 +679,18 @@ private fun ProcessorRuleRow(
     interactive: Boolean = true,
     isDragging: Boolean = false,
 ) {
-    var pressed by remember(processor.component) { mutableStateOf(false) }
-    val change by rememberUpdatedState(onCheckedChange)
-    val currentHidden by rememberUpdatedState(hidden)
-    val active = isDragging || pressed
+    val interactions = remember(processor.component) { MutableInteractionSource() }
+    val pressed by interactions.collectIsPressedAsState()
+    val focused by interactions.collectIsFocusedAsState()
+    val active = isDragging || pressed || focused
     val interactionModifier = if (interactive) Modifier
-        .pointerInput(enabled) {
-            if (enabled) detectTapGestures(
-                onPress = {
-                    pressed = true
-                    try { tryAwaitRelease() } finally { pressed = false }
-                },
-                onTap = { change(!currentHidden) },
-            )
-        }
+        .toggleable(value = hidden, enabled = enabled, role = Role.Checkbox,
+            interactionSource = interactions, indication = null, onValueChange = onCheckedChange)
         .semantics(mergeDescendants = true) {
-            contentDescription = "${processor.label}，${processor.summary}" + (lockedReason?.let { "，$it" } ?: "")
-            role = Role.Checkbox
-            toggleableState = ToggleableState(hidden)
+            stateDescription = (if (hidden) "已隐藏" else "显示中") + (lockedReason?.let { "，$it" } ?: "")
             customActions = accessibilityActions
-            if (!enabled) disabled()
-            onClick { if (enabled) { change(!currentHidden); true } else false }
+            onClick(label = if (hidden) "显示此选项" else "隐藏此选项", action = null)
         } else Modifier
-    DisposableEffect(processor.component) { onDispose { pressed = false } }
     Card(modifier = modifier.padding(horizontal = 16.dp, vertical = 3.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().heightIn(min = 66.dp)
@@ -558,22 +698,20 @@ private fun ProcessorRuleRow(
                 .then(interactionModifier),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            val handleColor = MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = if (enabled) 0.58f else 0.3f)
+            val handleColor = MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = if (!enabled) 0.3f else if (handleEnabled) 0.58f else 0.4f)
             Box(
-                modifier = Modifier.size(48.dp).semantics {
-                    contentDescription = if (handleEnabled) "拖动${processor.label}调整顺序" else "${processor.label}，$lockedReason"
-                },
+                modifier = Modifier.size(48.dp).clearAndSetSemantics { },
                 contentAlignment = Alignment.Center,
             ) {
                 if (lockedReason == null) DragGrip(handleColor) else LockGrip(handleColor)
             }
             Column(modifier = Modifier.weight(1f).padding(vertical = 10.dp)) {
                 Text(processor.label, fontSize = 16.sp, fontWeight = FontWeight.Medium,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis,
                     color = MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = if (enabled) 1f else 0.45f))
                 Text(processor.summary, modifier = Modifier.padding(top = 2.dp), fontSize = 10.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    color = MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = if (enabled) 0.55f else 0.3f))
+                    color = MiuixTheme.colorScheme.onSurfaceContainerVariant.copy(alpha = if (enabled) 1f else 0.45f))
             }
             Box(modifier = Modifier.padding(start = 10.dp, end = 16.dp)) { RuleCheck(hidden, enabled) }
         }
@@ -582,8 +720,8 @@ private fun ProcessorRuleRow(
 
 @Composable
 private fun RuleCheck(checked: Boolean, enabled: Boolean) {
-    val foreground = Color.White.copy(alpha = if (enabled) 1f else 0.6f)
-    val selected = Color(0xFF536B9F).copy(alpha = if (enabled) 1f else 0.4f)
+    val foreground = MiuixTheme.colorScheme.onPrimary.copy(alpha = if (enabled) 1f else 0.6f)
+    val selected = MiuixTheme.colorScheme.primary.copy(alpha = if (enabled) 1f else 0.4f)
     val empty = MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = if (enabled) 0.1f else 0.05f)
     Canvas(modifier = Modifier.size(25.dp)) {
         drawCircle(if (checked) selected else empty)
@@ -642,7 +780,6 @@ internal fun mergeOrder(previous: List<String>, visible: List<String>, fixed: Se
     }
 }
 
-@Suppress("UseKtx")
 private fun loadProcessors(activity: ComponentActivity, hiddenComponents: Set<String>): List<Processor> {
     val intent = Intent(Intent.ACTION_PROCESS_TEXT).setType("text/plain").putExtra(SystemRuleStore.QUERY_ORIGINAL_EXTRA, true)
     val packageManager = activity.packageManager
