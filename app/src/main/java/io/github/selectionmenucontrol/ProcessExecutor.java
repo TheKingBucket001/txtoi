@@ -60,6 +60,10 @@ final class ProcessExecutor {
         this.clock = clock;
     }
 
+    long clockNowNanos() {
+        return clock.getAsLong();
+    }
+
     Result execute(String executable, String command, long timeoutMillis, int outputLimit) {
         long started = clock.getAsLong();
         long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(1L, timeoutMillis));
@@ -93,10 +97,10 @@ final class ProcessExecutor {
                     exitCode = process.exitValue();
                     // A descendant retaining stdout must not keep this call waiting for EOF.
                     pump.exited = true;
-                    remaining = deadline - clock.getAsLong();
-                    if (remaining > 0L) {
-                        outputThread.join(Math.max(1L,
-                                TimeUnit.NANOSECONDS.toMillis(remaining)));
+                    while (outputThread.isAlive() && (remaining = deadline - clock.getAsLong()) > 0L) {
+                        long slice = Math.min(remaining, WAIT_SLICE_NANOS);
+                        outputThread.join(TimeUnit.NANOSECONDS.toMillis(slice),
+                                (int) (slice % TimeUnit.MILLISECONDS.toNanos(1)));
                     }
                     status = outputThread.isAlive() || clock.getAsLong() >= deadline ? Status.TIMEOUT
                             : pump.failed ? Status.OUTPUT_FAILED : Status.EXITED;

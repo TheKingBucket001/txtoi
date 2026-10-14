@@ -13,6 +13,18 @@ internal sealed interface PendingJournalRead {
     data class Found(val record: PendingJournalRecord) : PendingJournalRead
 }
 
+/** A missing durable journal must not replace the first remembered baseline with a later draft. */
+internal fun nextPendingJournalRecord(
+    id: String,
+    previous: PendingJournalRecord?,
+    remembered: PendingJournalRecord?,
+    newBaseline: String?,
+    target: String,
+): PendingJournalRecord {
+    val source = previous ?: remembered
+    return PendingJournalRecord(id, if (source != null) source.baseline else newBaseline, target, source?.inFlight)
+}
+
 /** Preserve the original baseline when a failed durable stage still has a newer memory draft. */
 internal fun pendingRecoveryRecord(
     read: PendingJournalRead,

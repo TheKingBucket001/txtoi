@@ -12,8 +12,10 @@ import java.util.UUID;
 /** Global is authoritative; private data is only a checked backup or a pending transaction. */
 final class SystemRuleStore {
     static final String SETTING_KEY = "selection_menu_control_rules_v1";
-    static final String PROBE_REQUEST_KEY = "selection_menu_control_probe_request_v1";
-    static final String PROBE_RESPONSE_KEY = "selection_menu_control_probe_response_v1";
+    // A v3 namespace prevents a stale v1/v2 response left by an older module from
+    // being mistaken for the current session or polluting its cleanup fence.
+    static final String PROBE_REQUEST_KEY = "selection_menu_control_probe_request_v3";
+    static final String PROBE_RESPONSE_KEY = "selection_menu_control_probe_response_v3";
     static final String PREFERENCES_NAME = "selection_menu_control_rules";
     static final String QUERY_ORIGINAL_EXTRA = "io.github.selectionmenucontrol.QUERY_ORIGINAL";
     static final String MENU_CLASSIFICATION_KEY = "io.github.selectionmenucontrol.MENU_CLASSIFICATION";
@@ -52,45 +54,79 @@ final class SystemRuleStore {
             return Snapshot.unavailable(ReadStatus.UNREADABLE);
         }
     }
-    static ProbeRequest beginProbe(Context context) {
+    static ProbeStart beginProbe(Context context) {
         String nonce = UUID.randomUUID().toString().replace("-", "");
         int boot = getBootCount(context);
-        if (boot < 0) return null;
-        String prefix = "v2:" + nonce + ":" + boot + ":" + BuildConfig.VERSION_CODE + ":";
-        RootAccess.ExecutionResult result = RootAccess.prepareProbe(PROBE_REQUEST_KEY,
-                PROBE_RESPONSE_KEY, prefix, "v2:pending:0:0:0");
-        if (!result.success) {
-            ModuleDiagnostics.fault(ModuleDiagnostics.Code.PROBE_FAILED);
-            return null;
+        if (boot < 0) return new ProbeStart(false, "无法读取本次启动信息", null, null);
+        long issuedAt = SystemClock.elapsedRealtime();
+        ProbeRequest request = new ProbeRequest(nonce, issuedAt, boot, BuildConfig.VERSION_CODE,
+                ProbeProtocol.CAPABILITY, BuildConfig.PROBE_BUILD_ID);
+        String prefix = ProbeProtocol.requestPrefix(nonce, boot, request.version, request.buildId);
+        RootAccess.ExecutionResult prepared = RootAccess.prepareProbe(PROBE_REQUEST_KEY,
+                PROBE_RESPONSE_KEY, prefix);
+        return preparedProbe(request, prepared);
+    }
+    static ProbeStart preparedProbe(ProbeRequest request, RootAccess.ExecutionResult prepared) {
+        if (!prepared.success) {
+            ModuleDiagnostics.fault(rootFailureCode(prepared.failure));
+            // Preparation may have committed before verification or timeout failed.
+            // Keep ownership even after failure so the caller can fence and clean it.
+            return new ProbeStart(false, RootAccess.failureMessage(prepared), request, prepared);
         }
-        try {
-            ProbeProtocol.Record record = ProbeProtocol.parse(Settings.Global.getString(
-                    context.getContentResolver(), PROBE_REQUEST_KEY));
-            if (record == null || !nonce.equals(record.nonce)) return null;
-            return new ProbeRequest(nonce, record.uptime);
-        } catch (Exception error) {
-            ModuleDiagnostics.fault(ModuleDiagnostics.Code.PROBE_FAILED);
-            return null;
-        }
+        recoverRootFailures();
+        return new ProbeStart(true, "系统作用域检测请求已写入", request, prepared);
     }
     static HookStatus readProbeResponse(Context context, ProbeRequest request) {
         if (request == null) return HookStatus.unavailable();
+        long started = SystemClock.elapsedRealtime();
         try {
-            ProbeProtocol.Record response = ProbeProtocol.parse(Settings.Global.getString(
-                    context.getContentResolver(), PROBE_RESPONSE_KEY));
-            boolean valid = ProbeProtocol.matches(response, request.nonce, request.issuedAt,
-                    getBootCount(context), BuildConfig.VERSION_CODE, SystemClock.elapsedRealtime(), PROBE_VALIDITY_MS);
-            if (valid) ModuleDiagnostics.recover(ModuleDiagnostics.Code.PROBE_FAILED);
-            return new HookStatus(valid);
+            ProbeProtocol.Status status = ProbeProtocol.evaluate(Settings.Global.getString(
+                    context.getContentResolver(), PROBE_RESPONSE_KEY), request.nonce, request.issuedAt,
+                    getBootCount(context), request.version, request.buildId,
+                    SystemClock.elapsedRealtime(), PROBE_VALIDITY_MS);
+            return probeStatus(status);
         } catch (Exception error) {
-            ModuleDiagnostics.fault(ModuleDiagnostics.Code.PROBE_FAILED);
-            return HookStatus.unavailable();
+            return probeStatus(ProbeProtocol.Status.READ_FAILED);
+        } finally {
+            ModuleDiagnostics.metric(ModuleDiagnostics.Metric.PROBE_RESPONSE_MS,
+                    SystemClock.elapsedRealtime() - started);
         }
     }
-    static void cancelProbe(ProbeRequest request) {
-        if (request == null) return;
-        String prefix = "v2:" + request.nonce + ":";
-        RootAccess.cleanupProbe(PROBE_REQUEST_KEY, PROBE_RESPONSE_KEY, prefix);
+    static HookStatus probeStatus(ProbeProtocol.Status status) {
+        return probeStatus(status, null);
+    }
+    static HookStatus probeStatus(ProbeProtocol.Status status, String detail) {
+        if (status == ProbeProtocol.Status.READY) {
+            for (ModuleDiagnostics.Code code : new ModuleDiagnostics.Code[]{ModuleDiagnostics.Code.PROBE_FAILED,
+                    ModuleDiagnostics.Code.PROBE_READ_FAILED, ModuleDiagnostics.Code.PROBE_INCOMPATIBLE,
+                    ModuleDiagnostics.Code.PROBE_EXPIRED, ModuleDiagnostics.Code.PROBE_INVALID,
+                    ModuleDiagnostics.Code.PROBE_NO_RESPONSE, ModuleDiagnostics.Code.PROBE_PREPARATION_FAILED,
+                    ModuleDiagnostics.Code.PROBE_QUERY_FAILED}) ModuleDiagnostics.recover(code);
+        } else {
+            ModuleDiagnostics.Code code;
+            switch (status) {
+                case PREPARATION_FAILED: code = ModuleDiagnostics.Code.PROBE_PREPARATION_FAILED; break;
+                case QUERY_FAILED: code = ModuleDiagnostics.Code.PROBE_QUERY_FAILED; break;
+                case READ_FAILED: code = ModuleDiagnostics.Code.PROBE_READ_FAILED; break;
+                case INCOMPATIBLE: code = ModuleDiagnostics.Code.PROBE_INCOMPATIBLE; break;
+                case EXPIRED: code = ModuleDiagnostics.Code.PROBE_EXPIRED; break;
+                case INVALID_RESPONSE: code = ModuleDiagnostics.Code.PROBE_INVALID; break;
+                default: code = ModuleDiagnostics.Code.PROBE_NO_RESPONSE;
+            }
+            ModuleDiagnostics.fault(code);
+        }
+        return new HookStatus(status, detail);
+    }
+    static RootAccess.ExecutionResult cancelProbe(ProbeRequest request) {
+        if (request == null) return new RootAccess.ExecutionResult(RootAccess.Failure.NONE, 0L, 0, false);
+        String prefix = ProbeProtocol.PREFIX + request.nonce + ":";
+        RootAccess.ExecutionResult result = RootAccess.cleanupProbe(PROBE_REQUEST_KEY, PROBE_RESPONSE_KEY, prefix);
+        if (result.success) ModuleDiagnostics.recover(ModuleDiagnostics.Code.PROBE_CLEANUP_FAILED);
+        else {
+            ModuleDiagnostics.fault(ModuleDiagnostics.Code.PROBE_CLEANUP_FAILED);
+            ModuleDiagnostics.fault(rootFailureCode(result.failure));
+        }
+        return result;
     }
     private static int getBootCount(Context context) {
         try { return Settings.Global.getInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, -1); }
@@ -112,8 +148,11 @@ final class SystemRuleStore {
             ModuleDiagnostics.fault(rootFailureCode(result.failure));
             return new SaveResult(false, false, result.uncertainWrite || result.failure == RootAccess.Failure.LOCK_BUSY);
         }
-        for (RootAccess.Failure failure : RootAccess.Failure.values()) ModuleDiagnostics.recover(rootFailureCode(failure));
+        recoverRootFailures();
         return new SaveResult(true, repairBackup(context), false);
+    }
+    private static void recoverRootFailures() {
+        for (RootAccess.Failure failure : RootAccess.Failure.values()) ModuleDiagnostics.recover(rootFailureCode(failure));
     }
     private static ModuleDiagnostics.Code rootFailureCode(RootAccess.Failure failure) {
         switch (failure) {
@@ -139,18 +178,22 @@ final class SystemRuleStore {
             if (!current.valid || current.value == null) return false;
             String encoded = decode(current.value).encode();
             android.content.SharedPreferences preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE);
-            if (encoded.equals(preferences.getString(SETTING_KEY, null)) && preferences.getBoolean("global_established", false)) {
+            if (persistBackup(preferences, encoded)) {
                 ModuleDiagnostics.recover(ModuleDiagnostics.Code.BACKUP_FAILED);
                 return true;
             }
-            for (int attempt = 0; attempt < 2; attempt++) {
-                if (preferences.edit().putString(SETTING_KEY, encoded).putBoolean("global_established", true).commit()) {
-                    ModuleDiagnostics.recover(ModuleDiagnostics.Code.BACKUP_FAILED);
-                    return true;
-                }
-            }
         } catch (Exception ignored) { /* Report a finite code, never rule contents. */ }
         ModuleDiagnostics.fault(ModuleDiagnostics.Code.BACKUP_FAILED);
+        return false;
+    }
+    static boolean persistBackup(android.content.SharedPreferences preferences, String encoded) {
+        // commit=false can still update preferences memory. Equal memory values are
+        // not a disk receipt; SharedPreferences skips disk IO for confirmed generations.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (preferences.edit().putString(SETTING_KEY, encoded).putBoolean("global_established", true).commit()) {
+                return true;
+            }
+        }
         return false;
     }
     static synchronized boolean migrateToGlobal(Context context, Snapshot snapshot) {
@@ -178,10 +221,14 @@ final class SystemRuleStore {
             ProbeProtocol.Record request = ProbeProtocol.parse(Settings.Global.getString(
                     context.getContentResolver(), PROBE_REQUEST_KEY));
             long now = SystemClock.elapsedRealtime();
-            if (!ProbeProtocol.current(request, getBootCount(context), BuildConfig.VERSION_CODE, now, PROBE_VALIDITY_MS)
+            if (!ProbeProtocol.currentRequest(request, getBootCount(context), now, PROBE_VALIDITY_MS)
                     || request.nonce.equals(lastRespondedNonce)) return null;
-            String response = "v2:" + request.nonce + ":" + request.boot + ":" + BuildConfig.VERSION_CODE + ":" + now;
-            if (Settings.Global.putString(context.getContentResolver(), PROBE_RESPONSE_KEY, response)) return request.nonce;
+            String response = ProbeProtocol.response(request, BuildConfig.VERSION_CODE, BuildConfig.PROBE_BUILD_ID, now);
+            if (Settings.Global.putString(context.getContentResolver(), PROBE_RESPONSE_KEY, response)) {
+                ModuleDiagnostics.recover(ModuleDiagnostics.Code.PROBE_FAILED);
+                return request.nonce;
+            }
+            ModuleDiagnostics.fault(ModuleDiagnostics.Code.PROBE_FAILED);
         } catch (Exception error) { ModuleDiagnostics.fault(ModuleDiagnostics.Code.PROBE_FAILED); }
         finally { Binder.restoreCallingIdentity(identity); }
         // Another user may have submitted a new nonce; never clear their request here.
@@ -234,12 +281,48 @@ final class SystemRuleStore {
     }
     static final class HookStatus {
         final boolean loadedForCurrentBoot;
-        HookStatus(boolean loaded) { loadedForCurrentBoot = loaded; }
-        static HookStatus unavailable() { return new HookStatus(false); }
+        final ProbeProtocol.Status status;
+        final String message;
+        HookStatus(ProbeProtocol.Status status) {
+            this(status, null);
+        }
+        HookStatus(ProbeProtocol.Status status, String detail) {
+            this.status = status;
+            loadedForCurrentBoot = status == ProbeProtocol.Status.READY;
+            String message;
+            switch (status) {
+                case READY: message = "当前构建已响应本次检测"; break;
+                case PREPARATION_FAILED: message = "无法准备作用域检测请求，请重新检查"; break;
+                case QUERY_FAILED: message = "系统查询未完成，无法确认作用域，请重新检查"; break;
+                case READ_FAILED: message = "无法读取检测回执，请重试"; break;
+                case INCOMPATIBLE: message = "系统中加载的是其他构建或旧检测协议，需重新加载模块"; break;
+                case EXPIRED: message = "检测回执已过期，请重试"; break;
+                case INVALID_RESPONSE: message = "检测回执格式或时间无效，请重试"; break;
+                default: message = "未收到本次检测回执，暂时无法确认模块状态";
+            }
+            this.message = detail != null && !detail.isEmpty() ? detail : message;
+        }
+        static HookStatus unavailable() { return new HookStatus(ProbeProtocol.Status.NO_RESPONSE); }
     }
     static final class ProbeRequest {
         final String nonce;
         final long issuedAt;
-        ProbeRequest(String nonce, long issuedAt) { this.nonce = nonce; this.issuedAt = issuedAt; }
+        final int boot, version, capability;
+        final String buildId;
+        ProbeRequest(String nonce, long issuedAt, int boot, int version, int capability, String buildId) {
+            this.nonce = nonce; this.issuedAt = issuedAt; this.boot = boot;
+            this.version = version; this.capability = capability; this.buildId = buildId;
+        }
+    }
+    static final class ProbeStart {
+        /** Whether the v3 probe request was prepared; Root has already been gated separately. */
+        final boolean prepared;
+        final String preparationMessage;
+        final ProbeRequest request;
+        final RootAccess.ExecutionResult preparation;
+        ProbeStart(boolean prepared, String preparationMessage, ProbeRequest request, RootAccess.ExecutionResult preparation) {
+            this.prepared = prepared; this.preparationMessage = preparationMessage; this.request = request;
+            this.preparation = preparation;
+        }
     }
 }

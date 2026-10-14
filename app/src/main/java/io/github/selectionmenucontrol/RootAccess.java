@@ -43,11 +43,17 @@ final class RootAccess {
     private RootAccess() {
     }
 
+    /** Perform the short, side-effect-free Root gate before any Global mutation. */
     static Result check() {
-        ProcessExecutor.Result process = executeWithCandidates("id", 2048, SU_COMMANDS, EXECUTOR);
+        return check(executeWithCandidates("id", 2048, SU_COMMANDS, EXECUTOR));
+    }
+
+    /** Package-visible seam keeps the identity rule deterministic in unit tests. */
+    static Result check(ProcessExecutor.Result process) {
         ExecutionResult execution = result(process, false, false);
         if (execution.success && (process.outputTruncated || !ROOT_ID.matcher(process.output).find())) {
-            execution = new ExecutionResult(Failure.NOT_ROOT, process.elapsedMillis, process.exitCode, false);
+            execution = new ExecutionResult(Failure.NOT_ROOT, process.elapsedMillis,
+                    process.exitCode, false);
         }
         return new Result(execution);
     }
@@ -78,16 +84,24 @@ final class RootAccess {
     }
 
     static ExecutionResult prepareProbe(String requestKey, String responseKey,
-                                        String requestPrefix, String pendingValue) {
+                                        String requestPrefix) {
         long revision = nextRevision();
-        return executeMutation(RootCommandProtocol.probe(requestKey, responseKey,
-                requestPrefix, pendingValue, revision, revision / 1_000_000L + TIMEOUT_MS), true);
+        String command = RootCommandProtocol.probe(requestKey, responseKey,
+                requestPrefix, revision, revision / 1_000_000L + TIMEOUT_MS);
+        if (command == null) return invalid();
+        ProcessExecutor.Result process = executeWithCandidates(command, 0, SU_COMMANDS, EXECUTOR);
+        ModuleDiagnostics.metric(ModuleDiagnostics.Metric.PROBE_PREPARE_MS, process.elapsedMillis);
+        return result(process, true, true);
     }
 
     static ExecutionResult cleanupProbe(String requestKey, String responseKey, String prefix) {
         long revision = nextRevision();
-        return executeMutation(RootCommandProtocol.cleanupProbe(requestKey, responseKey,
+        long started = SystemClock.elapsedRealtime();
+        ExecutionResult result = executeMutation(RootCommandProtocol.cleanupProbe(requestKey, responseKey,
                 prefix, revision, revision / 1_000_000L + TIMEOUT_MS), true);
+        ModuleDiagnostics.metric(ModuleDiagnostics.Metric.PROBE_CLEANUP_MS,
+                SystemClock.elapsedRealtime() - started);
+        return result;
     }
 
     /** A successful fence observes stable Global and blocks all older not-yet-started scripts. */
@@ -121,9 +135,9 @@ final class RootAccess {
 
     static ProcessExecutor.Result executeWithCandidates(String command, int captureLimit,
                                                         String[] candidates, ProcessExecutor executor) {
-        long started = System.nanoTime();
+        long started = executor.clockNowNanos();
         for (String candidate : candidates) {
-            long elapsed = (System.nanoTime() - started) / 1_000_000L;
+            long elapsed = (executor.clockNowNanos() - started) / 1_000_000L;
             if (elapsed >= TIMEOUT_MS) {
                 return new ProcessExecutor.Result(ProcessExecutor.Status.TIMEOUT, -1,
                         elapsed, "", false);
@@ -139,7 +153,7 @@ final class RootAccess {
                     attempt.output, attempt.outputTruncated);
         }
         return new ProcessExecutor.Result(ProcessExecutor.Status.START_FAILED, -2,
-                (System.nanoTime() - started) / 1_000_000L, "", false);
+                (executor.clockNowNanos() - started) / 1_000_000L, "", false);
     }
 
     static ExecutionResult result(ProcessExecutor.Result process, boolean mutation,
@@ -188,6 +202,28 @@ final class RootAccess {
         return new ExecutionResult(Failure.INVALID_INPUT, 0L, -1, false);
     }
 
+    static String failureMessage(ExecutionResult execution) {
+        switch (execution.failure) {
+            case NONE: return "Root 命令执行通过";
+            case TIMEOUT: return "Root 命令执行超时，请重试";
+            case INTERRUPTED: return "Root 命令被中断";
+            case DENIED: return "Root 请求被拒绝";
+            case NOT_ROOT: return "su 返回的身份不是 uid=0";
+            case NO_SU: return "无法找到可用的 su";
+            case START_FAILED: return "无法启动 su";
+            case LOCK_BUSY: return "Root 操作繁忙，请重试";
+            case EXPIRED: return "Root 操作请求已过期";
+            case STALE_REVISION: return "Root 操作请求已被更新";
+            case WRITE_FAILED: return "系统设置写入失败";
+            case VERIFY_FAILED: return "系统设置写入核验失败";
+            case STORAGE_FAILED: return "Root 临时锁不可用";
+            case PROTOCOL_FAILED: return "Root 命令协议失败";
+            case OUTPUT_FAILED: return "Root 命令输出失败";
+            case INVALID_INPUT: return "Root 命令参数无效";
+            default: return "Root 命令未完成";
+        }
+    }
+
     private static boolean isMissingExecutable(String suCommand) {
         if (suCommand.indexOf('/') >= 0) {
             return !new File(suCommand).isFile();
@@ -212,15 +248,8 @@ final class RootAccess {
         Result(ExecutionResult execution) {
             this.execution = execution;
             granted = execution.success;
-            switch (execution.failure) {
-                case NONE: message = "已获得 uid=0"; break;
-                case NO_SU: message = "无法找到可用的 su"; break;
-                case TIMEOUT: message = "Root 授权请求超时"; break;
-                case INTERRUPTED: message = "Root 检测被中断"; break;
-                case DENIED: message = "Root 请求被拒绝"; break;
-                case NOT_ROOT: message = "su 返回的身份不是 uid=0"; break;
-                default: message = "无法调用 su";
-            }
+            message = execution.success ? "已获得 uid=0" : failureMessage(execution);
         }
     }
+
 }

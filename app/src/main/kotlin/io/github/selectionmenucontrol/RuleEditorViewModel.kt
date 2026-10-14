@@ -20,6 +20,11 @@ internal class RuleEditorViewModel : ViewModel() {
         RuleSaveCoordinator.submit(snapshot)
     }
 
+    fun discardUnsaved() {
+        notifiedSuccessVersion = state.value?.successVersion ?: notifiedSuccessVersion
+        RuleSaveCoordinator.discardUnsaved()
+    }
+
     fun consumeFailure(): Boolean {
         val version = state.value?.failureVersion ?: 0
         if (version <= notifiedFailureVersion) return false

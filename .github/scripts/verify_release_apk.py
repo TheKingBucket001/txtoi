@@ -9,10 +9,13 @@ import subprocess
 import sys
 import zipfile
 
+from source_identity import identity_record
+
 
 APPLICATION_ID = "io.github.selectionmenucontrol"
 CERTIFICATE_SHA256 = "e02cb80dbf26663f4a85afb7bcd0b7a35e9bbaa255082e8d3436b5121f861d2d"
 ENTRY_POINT = APPLICATION_ID + ".SelectionMenuModule"
+SOURCE_IDENTITY_ASSET = "assets/probe-build.json"
 
 
 def require(condition, message):
@@ -34,7 +37,33 @@ def run_tool(arguments):
     return result.stdout
 
 
-def verify_apk(apk, metadata_path, tag, build_tools, runner=run_tool):
+def verify_source_identity(archive, source_root, r8_candidate):
+    entries = [entry for entry in archive.infolist() if entry.filename == SOURCE_IDENTITY_ASSET]
+    require(len(entries) == 1, "APK must contain one unique production source identity")
+    require(entries[0].file_size <= 4096, "APK source identity is oversized")
+
+    def unique_fields(pairs):
+        fields = {}
+        for key, value in pairs:
+            require(key not in fields, "APK source identity has duplicate fields")
+            fields[key] = value
+        return fields
+
+    try:
+        record = json.loads(archive.read(entries[0]).decode("utf-8"), object_pairs_hook=unique_fields)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("APK source identity is malformed") from error
+    require(isinstance(record, dict) and set(record) == {"schema", "variant", "r8Candidate", "buildId"}
+            and type(record["schema"]) is int and record["schema"] == 1
+            and type(record["r8Candidate"]) is bool
+            and isinstance(record["buildId"], str) and re.fullmatch(r"[0-9a-f]{64}", record["buildId"]),
+            "APK source identity fields are invalid")
+    expected = identity_record(source_root, "release", r8_candidate)
+    require(record == expected, "APK production source identity does not match the current source and build parameters")
+    return expected["buildId"]
+
+
+def verify_apk(apk, metadata_path, tag, build_tools, source_root, r8_candidate=False, runner=run_tool):
     apk = Path(apk)
     metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
     require(metadata.get("applicationId") == APPLICATION_ID, "Build metadata application ID is incorrect")
@@ -61,6 +90,7 @@ def verify_apk(apk, metadata_path, tag, build_tools, runner=run_tool):
     require(not re.search(r"^application-debuggable(?:\s|$)", badging, re.MULTILINE), "A debuggable APK cannot be released")
 
     with zipfile.ZipFile(apk) as archive:
+        probe_build_id = verify_source_identity(archive, source_root, r8_candidate)
         require("assets/xposed_init" not in archive.namelist(), "Legacy Xposed entry is forbidden")
         scope = archive.read("META-INF/xposed/scope.list").decode("utf-8").strip()
         entry = archive.read("META-INF/xposed/java_init.list").decode("utf-8").strip()
@@ -70,7 +100,8 @@ def verify_apk(apk, metadata_path, tag, build_tools, runner=run_tool):
         properties = dict(line.strip().split("=", 1) for line in properties.splitlines() if "=" in line and not line.lstrip().startswith(("#", "!")))
         require(properties.get("staticScope", "").strip() == "true", "Release must declare staticScope=true")
 
-    return {"apk_name": apk.name, "apk_sha256": sha256_file(apk), "version_code": version_code, "version_name": version_name}
+    return {"apk_name": apk.name, "apk_sha256": sha256_file(apk), "version_code": version_code,
+            "version_name": version_name, "probe_build_id": probe_build_id}
 
 
 def main():
@@ -79,9 +110,12 @@ def main():
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--build-tools", required=True)
+    parser.add_argument("--source-root", required=True)
+    parser.add_argument("--r8-candidate", choices=("true", "false"), default="false")
     parser.add_argument("--github-output")
     args = parser.parse_args()
-    verified = verify_apk(args.apk, args.metadata, args.tag, args.build_tools)
+    verified = verify_apk(args.apk, args.metadata, args.tag, args.build_tools, args.source_root,
+                          args.r8_candidate == "true")
     if args.github_output:
         with Path(args.github_output).open("a", encoding="utf-8") as output:
             for key, value in verified.items():

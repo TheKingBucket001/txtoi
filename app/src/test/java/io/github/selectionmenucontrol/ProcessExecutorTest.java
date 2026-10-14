@@ -14,9 +14,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicLong;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 public class ProcessExecutorTest {
+    @Rule public TemporaryFolder temporary = new TemporaryFolder();
+
     @Test(timeout = 10_000L)
     public void drainsLargeMergedOutputWithoutPipeDeadlockOrRetainingIt() {
         ProcessExecutor.Result result = childExecutor().execute("ignored", "flood", 5_000L, 0);
@@ -103,6 +107,63 @@ public class ProcessExecutorTest {
         assertEquals(6_000L, result.get().elapsedMillis);
     }
 
+    @Test(timeout = 5_000L)
+    public void outputJoinRechecksSleepInclusiveClockBeforeItsOriginalWaitExpires() throws Exception {
+        AtomicLong clock = new AtomicLong(1_000_000_000L);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Thread> reader = new AtomicReference<>();
+        InputStream input = new InputStream() {
+            @Override public int available() {
+                reader.set(Thread.currentThread());
+                entered.countDown();
+                boolean interrupted = false;
+                try {
+                    // Model a stream whose synchronized availability check is temporarily held.
+                    // It stays held until close, including when the reader is interrupted.
+                    while (true) {
+                        try { release.await(); return 0; }
+                        catch (InterruptedException error) { interrupted = true; }
+                    }
+                } finally {
+                    if (interrupted) Thread.currentThread().interrupt();
+                }
+            }
+            @Override public int read() { return -1; }
+            @Override public void close() { release.countDown(); }
+        };
+        ProcessExecutor executor = new ProcessExecutor(
+                (executable, command) -> new FinishedProcess(0, input), clock::get);
+        AtomicReference<ProcessExecutor.Result> result = new AtomicReference<>();
+        Thread caller = new Thread(() -> result.set(executor.execute("ignored", "", 3_000L, 0)));
+        caller.start();
+        try {
+            assertTrue(entered.await(1_000L, TimeUnit.MILLISECONDS));
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            boolean outputJoinReached = false;
+            while (caller.isAlive() && System.nanoTime() < until) {
+                if (waitingInJoin(caller)) { outputJoinReached = true; break; }
+                Thread.yield();
+            }
+            assertTrue("Caller did not reach output join", outputJoinReached);
+            clock.addAndGet(6_000_000_000L);
+            caller.join(500L);
+            assertFalse("Expired output join waited on the original monotonic deadline", caller.isAlive());
+            assertEquals(ProcessExecutor.Status.TIMEOUT, result.get().status);
+            assertEquals(6_000L, result.get().elapsedMillis);
+        } finally {
+            input.close();
+            caller.interrupt();
+            caller.join(1_000L);
+            assertFalse("Test caller survived cleanup", caller.isAlive());
+            Thread output = reader.get();
+            if (output != null) {
+                output.join(1_000L);
+                assertFalse("Test output reader survived cleanup", output.isAlive());
+            }
+        }
+    }
+
     @Test
     public void unavailableOutputIsAnExplicitFailureWithoutItsExceptionText() {
         ProcessExecutor executor = new ProcessExecutor((executable, command) -> new FinishedProcess(0,
@@ -133,6 +194,25 @@ public class ProcessExecutorTest {
     }
 
     @Test
+    public void rootGateRequiresAnExplicitUidZeroIdentity() {
+        ProcessExecutor.Result root = new ProcessExecutor.Result(ProcessExecutor.Status.EXITED,
+                0, 8L, "uid=0(root) gid=0(root)\n", false);
+        ProcessExecutor.Result shell = new ProcessExecutor.Result(ProcessExecutor.Status.EXITED,
+                0, 8L, "uid=2000(shell) gid=2000(shell)\n", false);
+        ProcessExecutor.Result truncated = new ProcessExecutor.Result(ProcessExecutor.Status.EXITED,
+                0, 8L, "uid=0(root)", true);
+        assertTrue(RootAccess.check(root).granted);
+        assertEquals(RootAccess.Failure.NOT_ROOT, RootAccess.check(shell).execution.failure);
+        assertEquals(RootAccess.Failure.NOT_ROOT, RootAccess.check(truncated).execution.failure);
+        assertEquals("su 返回的身份不是 uid=0", RootAccess.check(shell).message);
+        assertEquals("已获得 uid=0", RootAccess.check(root).message);
+        for (String output : new String[]{"", "euid=0", "uid=00", "uid=0root", "uid=10000"}) {
+            assertFalse(output, RootAccess.check(new ProcessExecutor.Result(
+                    ProcessExecutor.Status.EXITED, 0, 8L, output, false)).granted);
+        }
+    }
+
+    @Test
     public void onlyAbsentExecutableAllowsFallback() {
         AtomicInteger calls = new AtomicInteger();
         ProcessExecutor executor = new ProcessExecutor((executable, command) -> {
@@ -145,6 +225,29 @@ public class ProcessExecutorTest {
                 new String[]{"/unavailable-selection-menu-su", "candidate-two"}, executor);
         assertEquals(2, calls.get());
         assertTrue(RootAccess.result(process, false, false).success);
+    }
+
+    @Test
+    public void expiredCandidateBudgetCountsSleepBeforeAnAbsentExecutableAllowsFallback() throws Exception {
+        AtomicLong clock = new AtomicLong(1_000_000_000L);
+        AtomicInteger calls = new AtomicInteger();
+        File absent = new File(temporary.newFolder(), "absent-selection-menu-su");
+        assertFalse(absent.exists());
+        ProcessExecutor executor = new ProcessExecutor((executable, command) -> {
+            if (calls.incrementAndGet() == 1) {
+                clock.addAndGet(6_000_000_000L);
+                throw new IOException("not found");
+            }
+            return new FinishedProcess(0, new ByteArrayInputStream("uid=0\n".getBytes()));
+        }, clock::get);
+
+        ProcessExecutor.Result process = RootAccess.executeWithCandidates("id", 2048,
+                new String[]{absent.getAbsolutePath(), "candidate-two"}, executor);
+
+        assertEquals(1, calls.get());
+        assertEquals(ProcessExecutor.Status.TIMEOUT, process.status);
+        assertEquals(6_000L, process.elapsedMillis);
+        assertEquals(RootAccess.Failure.TIMEOUT, RootAccess.result(process, false, false).failure);
     }
 
     @Test
@@ -167,6 +270,16 @@ public class ProcessExecutorTest {
 
     private static ProcessExecutor childExecutor() {
         return new ProcessExecutor((executable, command) -> launchChild(command));
+    }
+
+    private static boolean waitingInJoin(Thread thread) {
+        if (thread.getState() != Thread.State.TIMED_WAITING) return false;
+        for (StackTraceElement frame : thread.getStackTrace()) {
+            if (frame.getClassName().equals(Thread.class.getName()) && frame.getMethodName().equals("join")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Process launchChild(String action) throws IOException {

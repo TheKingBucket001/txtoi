@@ -10,6 +10,10 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -49,6 +53,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -66,6 +71,8 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.res.painterResource
@@ -82,6 +89,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -89,7 +97,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.IconButton
@@ -139,9 +149,35 @@ private data class RuleDragSession(
     val height: Float,
     val grabOffset: Float,
     val pointerY: Float,
+    val startPointerY: Float,
+    val pickupPaintedTop: Float,
+    val pickupSlotTop: Float,
+    val moved: Boolean = false,
     val startOrder: List<String>,
     val startRules: SystemRuleStore.Snapshot,
 )
+
+private data class RuleReleasedDrag(
+    val token: Int,
+    val component: String,
+    val height: Float,
+    val top: Animatable<Float, AnimationVector1D>,
+    val order: List<String>,
+    val hidden: Set<String>,
+)
+
+private class RuleVisualPositions {
+    var viewport: LayoutCoordinates? = null
+    val rows = HashMap<String, LayoutCoordinates>()
+
+    fun top(component: String): Float? {
+        val parent = viewport?.takeIf { it.isAttached } ?: return null
+        val row = rows[component]?.takeIf { it.isAttached } ?: return null
+        return parent.localPositionOf(row, Offset.Zero).y.takeIf { it.isFinite() }
+    }
+}
+
+private const val RuleReorderStiffness = 800f
 
 private data class RuleDragCallbacks(
     val start: (Offset) -> Boolean,
@@ -152,7 +188,12 @@ private data class RuleDragCallbacks(
 private enum class RestoreAction { HIDDEN, ORDER }
 
 @Composable
-internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
+internal fun RuleScreen(
+    activity: MainActivity,
+    awaitEnvironmentCheck: suspend () -> Unit,
+    modifier: Modifier = Modifier,
+    onAbout: () -> Unit,
+) {
     val editor = remember(activity) { ViewModelProvider(activity)[RuleEditorViewModel::class.java] }
     val saveState by editor.state.collectAsState()
     val recoveryChecking by editor.checking.collectAsState()
@@ -164,13 +205,20 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     var initializationError by remember { mutableStateOf<String?>(null) }
     var loadSignal by remember { mutableIntStateOf(0) }
     var dragSession by remember { mutableStateOf<RuleDragSession?>(null) }
+    var releasedDrag by remember { mutableStateOf<RuleReleasedDrag?>(null) }
     var dragToken by remember { mutableIntStateOf(0) }
     var optionSize by remember { mutableStateOf(IntSize.Zero) }
+    var coordinateState by remember { mutableStateOf<Pair<IntSize, Boolean>?>(null) }
     var restoreAction by rememberSaveable { mutableStateOf<RestoreAction?>(null) }
+    var discardPrompt by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(saveState?.verificationPending) {
+        if (saveState?.verificationPending != true) discardPrompt = false
+    }
     val movement = remember(displayedProcessors, snapshot.hiddenComponents) {
         RuleMovementIndex.create(displayedProcessors, snapshot.hiddenComponents)
     }
     val listState = rememberLazyListState()
+    val visualPositions = remember { RuleVisualPositions() }
     val density = LocalDensity.current
     val windowFocused = LocalWindowInfo.current.isWindowFocused
     val canChange = !initializing && !recoveryChecking && initializationError == null && snapshot.valid && saveState?.verificationPending != true
@@ -188,17 +236,38 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         if (movement.source === displayedProcessors && movement.hidden == hidden) movement
         else RuleMovementIndex.create(displayedProcessors, hidden)
 
+    fun reorderPresentation(next: List<Processor>) {
+        val firstIndex = listState.firstVisibleItemIndex
+        val firstKey = listState.layoutInfo.visibleItemsInfo
+            .firstOrNull { it.index == firstIndex }?.key as? String
+        if (firstKey != null && displayedProcessors.getOrNull(firstIndex)?.component == firstKey) {
+            val nextIndex = next.indexOfFirst { it.component == firstKey }
+            if (nextIndex >= 0 && nextIndex != firstIndex) {
+                // Internal reorders keep the viewport at its slot; package refreshes still follow keys.
+                listState.requestScrollToItem(firstIndex, listState.firstVisibleItemScrollOffset)
+            }
+        }
+        displayedProcessors = next
+    }
+
     fun cancelDrag() {
+        releasedDrag = null
         val current = dragSession ?: return
         dragSession = null
         val byComponent = displayedProcessors.associateBy { it.component }
-        displayedProcessors = current.startOrder.mapNotNull(byComponent::get)
+        reorderPresentation(current.startOrder.mapNotNull(byComponent::get))
     }
 
     fun synchronizePresentation() {
-        cancelDrag()
-        val latest = editor.state.value?.value?.takeIf { it.valid } ?: return
-        displayedProcessors = applyOrder(originalProcessors, latest.orderedComponents)
+        if (dragSession != null) cancelDrag()
+        val latest = editor.state.value?.value?.takeIf { it.valid }
+        if (latest == null) { releasedDrag = null; return }
+        val next = applyOrder(originalProcessors, latest.orderedComponents)
+        // Our own UP save can replay this same order while its visual handoff is running.
+        val released = releasedDrag
+        if (released != null && (released.order != next.map { it.component }
+                || released.hidden != latest.hiddenComponents)) releasedDrag = null
+        displayedProcessors = next
     }
 
     fun dragRulesUnchanged(start: SystemRuleStore.Snapshot): Boolean {
@@ -249,17 +318,21 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         if (loadSignal != 0) delay(150) // Coalesce replace/remove/add broadcasts into one read.
         initializing = true
         initializationError = null
+        // Scope readiness can precede probe cleanup. Its Root transaction must release
+        // the shared lock before migration or durable-draft recovery starts.
+        awaitEnvironmentCheck()
         val beforeLoad = editor.state.value
         val result = withContext(Dispatchers.IO) {
             try {
                 val draft = beforeLoad?.takeIf { it.pending && !it.verificationPending }?.value?.takeIf { it.valid }
-                val current = draft ?: SystemRuleStore.readApp(activity)
+                val requiresVerification = beforeLoad?.verificationPending == true
+                val current = draft ?: if (requiresVerification) SystemRuleStore.readGlobal(activity) else SystemRuleStore.readApp(activity)
                 when {
                     !current.valid -> RuleScreenData(current, emptyList(), "无法读取设置，请重新读取")
-                    draft == null && !SystemRuleStore.migrateToGlobal(activity, current) ->
+                    draft == null && !requiresVerification && !SystemRuleStore.migrateToGlobal(activity, current) ->
                         RuleScreenData(current, emptyList(), "无法载入设置，请确认 Root 授权后重试")
                     else -> try {
-                        val migrated = draft ?: SystemRuleStore.readApp(activity)
+                        val migrated = draft ?: if (requiresVerification) SystemRuleStore.readGlobal(activity) else SystemRuleStore.readApp(activity)
                         if (!migrated.valid) {
                             RuleScreenData(migrated, emptyList(), "无法读取设置，请重新读取")
                         } else {
@@ -296,6 +369,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return@LaunchedEffect
         if (editor.consumeFailure()) {
             dragSession = null
+            releasedDrag = null
             val result = editor.state.value ?: return@LaunchedEffect
             val actual = result.value
             displayedProcessors = applyOrder(originalProcessors, actual.orderedComponents)
@@ -320,6 +394,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
     }
 
     fun createAndSave(hidden: Set<String>, order: List<String>): Boolean {
+        releasedDrag = null
         if (initializing || editor.checking.value || initializationError != null || editor.state.value?.value?.valid != true
             || editor.state.value?.verificationPending == true || dragSession != null) {
             synchronizePresentation()
@@ -364,7 +439,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         val from = currentMovement.positions[component] ?: return false
         val to = from + direction
         if (from < 0 || to !in moving.indices) return false
-        displayedProcessors = moveVisibleProcessors(displayedProcessors, current.hiddenComponents, component, moving[to])
+        reorderPresentation(moveVisibleProcessors(displayedProcessors, current.hiddenComponents, component, moving[to]))
         return saveOrder()
     }
 
@@ -372,34 +447,55 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         val current = dragSession ?: return
         if (!commit) { cancelDrag(); return }
         if (!dragRulesUnchanged(current.startRules)) { synchronizePresentation(); return }
+        val top = RuleDragGeometry.top(current.pointerY, current.grabOffset, current.height,
+            optionBounds(listState, displayedProcessors.size))
         dragSession = null
-        if (current.startOrder != displayedProcessors.map { it.component }) saveOrder()
+        if (current.startOrder != displayedProcessors.map { it.component } && !saveOrder()) return
+        if (top != null) {
+            releasedDrag = RuleReleasedDrag(current.token, current.component, current.height, Animatable(top),
+                displayedProcessors.map { it.component }, current.startRules.hiddenComponents)
+        }
     }
 
     val dragCallbacks by rememberUpdatedState(RuleDragCallbacks(
         start = start@{ position ->
             if (!canChange || restoreAction != null || dragSession != null || position.x !in gripStart..gripEnd) return@start false
             val layout = listState.layoutInfo
-            val item = layout.visibleItemsInfo.firstOrNull {
-                position.y >= it.offset + rowGap && position.y <= it.offset + it.size - rowGap
-            } ?: return@start false
+            val released = releasedDrag
+            val releasedCell = released?.let {
+                RuleDragCell(it.component, displayedProcessors.indexOfFirst { processor -> processor.component == it.component },
+                    it.top.value, it.height)
+            }
+            val painted = layout.visibleItemsInfo.filter { it.key != released?.component }.map {
+                val component = it.key as String
+                RuleDragCell(component, it.index, visualPositions.top(component) ?: it.offset.toFloat(), it.size.toFloat())
+            }
+            val item = releasedCell?.let { RuleDragGeometry.hit(position.y, rowGap, listOf(it)) }
+                ?: RuleDragGeometry.hit(position.y, rowGap, painted) ?: return@start false
             val processor = displayedProcessors.getOrNull(item.index)?.takeIf { it.component == item.key } ?: return@start false
             if (editor.state.value?.verificationPending == true) return@start false
             val current = editor.state.value?.value?.takeIf { it.valid } ?: return@start false
             val actualPresentation = applyOrder(originalProcessors, current.orderedComponents)
             if (actualPresentation != displayedProcessors) {
+                releasedDrag = null
                 displayedProcessors = actualPresentation
                 return@start true // Absorb a stale grip gesture; its layout belongs to the previous order.
             }
             if (!movable(processor, current.hiddenComponents)) return@start false
             val bounds = optionBounds(listState, displayedProcessors.size)
-            val grabOffset = position.y - item.offset
-            if (RuleDragGeometry.top(position.y, grabOffset, item.size.toFloat(), bounds) == null) return@start false
-            dragSession = RuleDragSession(++dragToken, processor.component, item.size.toFloat(), grabOffset, position.y,
-                displayedProcessors.map { it.component }, current)
+            val grabOffset = position.y - item.top
+            val initialTop = RuleDragGeometry.top(position.y, grabOffset, item.height, bounds) ?: return@start false
+            val logical = layout.visibleItemsInfo.firstOrNull { it.key == item.key && it.index == item.index } ?: return@start false
+            releasedDrag = null
+            dragSession = RuleDragSession(token = ++dragToken, component = processor.component, height = item.height,
+                grabOffset = grabOffset, pointerY = position.y, startPointerY = position.y,
+                pickupPaintedTop = initialTop, pickupSlotTop = logical.offset.toFloat(),
+                startOrder = displayedProcessors.map { it.component }, startRules = current)
             true
         },
-        move = { pointerY -> dragSession = dragSession?.copy(pointerY = pointerY) },
+        move = { pointerY -> dragSession = dragSession?.let {
+            it.copy(pointerY = pointerY, moved = it.moved || pointerY != it.startPointerY)
+        } },
         finish = ::finishDrag,
     ))
 
@@ -422,18 +518,24 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                 val movingKeys = frameMovement.keys
                 // A layout predating a reorder must not become another insertion decision.
                 val visibleItems = listState.layoutInfo.visibleItemsInfo
-                val layoutMatches = visibleItems.all { displayed.getOrNull(it.index)?.component == it.key }
-                val target = if (layoutMatches) RuleDragGeometry.target(
-                    sourceIndex, top + active.height / 2f,
-                    visibleItems.map { RuleDragCell(it.key as String, it.index, it.offset.toFloat(), it.size.toFloat()) },
+                // Foundation 1.11.2 itemInfo.offset is the logical slot; placementDelta is paint only.
+                val cells = visibleItems.map { RuleDragCell(it.key as String, it.index, it.offset.toFloat(), it.size.toFloat()) }
+                val layoutMatches = RuleDragGeometry.matchesOrder(displayed.map { it.component }, cells)
+                // Pickup coordinates stay in the viewport: scrolling moves target slots past them.
+                val insertionCenter = RuleDragGeometry.insertionCenter(active.pointerY - active.grabOffset, active.height,
+                    active.pickupPaintedTop, active.pickupSlotTop, bounds)
+                val target = if (layoutMatches && active.moved && insertionCenter != null) RuleDragGeometry.target(
+                    sourceIndex, insertionCenter,
+                    cells,
                     movingKeys,
                 ) else null
                 if (target != null) {
-                    displayedProcessors = moveVisibleProcessors(displayedProcessors, hidden, active.component, target)
+                    reorderPresentation(moveVisibleProcessors(displayedProcessors, hidden, active.component, target))
                 }
                 val viewportTop = listState.layoutInfo.viewportStartOffset.toFloat()
                 val viewportBottom = listState.layoutInfo.viewportEndOffset.toFloat()
                 when {
+                    !active.moved -> 0f
                     active.pointerY < viewportTop + edgeSize && listState.canScrollBackward ->
                         -maxScrollSpeed * ((viewportTop + edgeSize - active.pointerY) / edgeSize).coerceIn(0f, 1f)
                     active.pointerY > viewportBottom - edgeSize && listState.canScrollForward ->
@@ -456,16 +558,42 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         }
     }
 
-    LaunchedEffect(optionSize, windowFocused) {
-        // Changed coordinates or focus invalidate the current grab.
-        if (dragSession != null) cancelDrag()
+    LaunchedEffect(releasedDrag?.token) {
+        val released = releasedDrag ?: return@LaunchedEffect
+        try {
+            // UP may have changed the order before LazyColumn has measured its final slot.
+            val cells = withTimeoutOrNull(200) {
+                snapshotFlow {
+                    listState.layoutInfo.visibleItemsInfo.map {
+                        RuleDragCell(it.key as String, it.index, it.offset.toFloat(), it.size.toFloat())
+                    }
+                }.first { RuleDragGeometry.matchesOrder(released.order, it) }
+            } ?: return@LaunchedEffect
+            val target = RuleDragGeometry.releaseTop(released.component, released.height, released.order, cells,
+                optionBounds(listState, displayedProcessors.size)) ?: return@LaunchedEffect
+            released.top.animateTo(target, spring(dampingRatio = Spring.DampingRatioNoBouncy,
+                stiffness = RuleReorderStiffness, visibilityThreshold = 0.5f))
+        } finally {
+            if (releasedDrag?.token == released.token) releasedDrag = null
+        }
     }
-    DisposableEffect(Unit) { onDispose { dragSession = null } }
+
+    LaunchedEffect(listState.isScrollInProgress) {
+        if (listState.isScrollInProgress) releasedDrag = null
+    }
+
+    LaunchedEffect(optionSize, windowFocused, canChange) {
+        val currentCoordinates = optionSize to windowFocused
+        val previousCoordinates = coordinateState
+        coordinateState = currentCoordinates
+        // Initial composition and a recovered gate do not invalidate a new pointer session.
+        if (!canChange || !windowFocused || (previousCoordinates != null && previousCoordinates != currentCoordinates)) cancelDrag()
+    }
+    DisposableEffect(Unit) { onDispose { dragSession = null; releasedDrag = null } }
     BackHandler(enabled = initializing || dragSession != null) { cancelDrag() }
 
     BoxWithConstraints(
-        modifier = Modifier.fillMaxSize().background(MiuixTheme.colorScheme.background)
-            .safeDrawingPadding(),
+        modifier = modifier.fillMaxSize().background(MiuixTheme.colorScheme.background),
     ) {
         val sectionLimit = maxHeight * 0.3f
         val stackActions = maxWidth < 360.dp || density.fontScale > 1.3f
@@ -482,7 +610,9 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                 Text("勾选隐藏 · 拖动排序 · 自动保存", modifier = Modifier.padding(top = 4.dp),
                     fontSize = 13.sp, color = MiuixTheme.colorScheme.onBackgroundVariant)
                 if (saveState?.verificationPending == true) {
-                    TextButton(text = "保存结果待核对 · 重新核对", onClick = { loadSignal++ }, enabled = !initializing,
+                    TextButton(text = "保存结果待核对 · 重新核对", onClick = { loadSignal++ }, enabled = !initializing && !recoveryChecking,
+                        modifier = Modifier.fillMaxWidth())
+                    TextButton(text = "放弃未保存更改", onClick = { discardPrompt = true }, enabled = !initializing && !recoveryChecking,
                         modifier = Modifier.fillMaxWidth())
                 }
                 if (originalProcessors.isNotEmpty()) {
@@ -497,6 +627,7 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
 
             Box(
                 modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds()
+                    .onGloballyPositioned { visualPositions.viewport = it }
                     .onSizeChanged {
                         if (optionSize != it) cancelDrag()
                         optionSize = it
@@ -565,11 +696,25 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                                 if (index >= 0 && index < movement.components.lastIndex) add(CustomAccessibilityAction("下移") { moveOne(processor.component, 1) })
                             } else emptyList()
                             val isPlaceholder = dragSession?.component == processor.component
+                            val released = releasedDrag?.takeIf { it.component == processor.component }
+                            val placement = if (isPlaceholder) Modifier.alpha(0f).clearAndSetSemantics { }
+                            else if (released != null) Modifier.zIndex(1f).offset {
+                                val slotTop = listState.layoutInfo.visibleItemsInfo
+                                    .firstOrNull { it.key == released.component }?.offset ?: released.top.value.roundToInt()
+                                IntOffset(0, overlayPixelTop(released.top.value, released.height,
+                                    optionBounds(listState, displayedProcessors.size)) - slotTop)
+                            }
+                            else Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null,
+                                placementSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = RuleReorderStiffness))
                             ProcessorRuleRow(
                                 processor = processor, hidden = hidden, enabled = canChange,
                                 handleEnabled = canChange && lockedReason == null, lockedReason = lockedReason,
                                 accessibilityActions = actions, interactive = !isPlaceholder,
-                                modifier = if (isPlaceholder) Modifier.alpha(0f).clearAndSetSemantics { } else Modifier,
+                                viewportHeight = optionSize.height,
+                                onMoveUp = if (canUseActions && index > 0) ({ if (moveOne(processor.component, -1)) Unit else Unit }) else null,
+                                onMoveDown = if (canUseActions && index >= 0 && index < movement.components.lastIndex)
+                                    ({ if (moveOne(processor.component, 1)) Unit else Unit }) else null,
+                                modifier = placement.onGloballyPositioned { visualPositions.rows[processor.component] = it },
                                 onCheckedChange = { changeHidden(processor.component) },
                             )
                         }
@@ -620,6 +765,19 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
                         else createAndSave(emptySet(), current.orderedComponents)
                     }
                 }, confirmEnabled = canUseActions)
+            }
+        })
+    }
+    if (discardPrompt && saveState?.verificationPending == true) {
+        WindowDialog(show = true, onDismissRequest = { discardPrompt = false }, content = {
+            Column(modifier = Modifier.dialogContent(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("放弃未保存更改", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("放弃尚未保存的更改，并读取手机当前设置。已生效的设置会保留。",
+                    fontSize = 14.sp, lineHeight = 20.sp)
+                DialogActions("取消", { discardPrompt = false }, "放弃更改", {
+                    discardPrompt = false
+                    editor.discardUnsaved()
+                }, confirmEnabled = !initializing && !recoveryChecking && saveState?.pending != true)
             }
         })
     }
@@ -678,11 +836,18 @@ private fun ProcessorRuleRow(
     accessibilityActions: List<CustomAccessibilityAction> = emptyList(),
     interactive: Boolean = true,
     isDragging: Boolean = false,
+    viewportHeight: Int = 0,
+    onMoveUp: (() -> Unit)? = null,
+    onMoveDown: (() -> Unit)? = null,
 ) {
     val interactions = remember(processor.component) { MutableInteractionSource() }
     val pressed by interactions.collectIsPressedAsState()
     val focused by interactions.collectIsFocusedAsState()
     val active = isDragging || pressed || focused
+    var bodyHeight by remember(processor.component) { mutableIntStateOf(0) }
+    val outerSpacing = with(LocalDensity.current) { 6.dp.toPx() }
+    val needsMoveButtons = interactive && lockedReason == null && viewportHeight > 0
+        && bodyHeight + outerSpacing > viewportHeight && (onMoveUp != null || onMoveDown != null)
     val interactionModifier = if (interactive) Modifier
         .toggleable(value = hidden, enabled = enabled, role = Role.Checkbox,
             interactionSource = interactions, indication = null, onValueChange = onCheckedChange)
@@ -694,6 +859,7 @@ private fun ProcessorRuleRow(
     Card(modifier = modifier.padding(horizontal = 16.dp, vertical = 3.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().heightIn(min = 66.dp)
+                .onSizeChanged { bodyHeight = it.height }
                 .background(if (active) MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = 0.09f) else Color.Transparent)
                 .then(interactionModifier),
             verticalAlignment = Alignment.CenterVertically,
@@ -714,6 +880,15 @@ private fun ProcessorRuleRow(
                     color = MiuixTheme.colorScheme.onSurfaceContainerVariant.copy(alpha = if (enabled) 1f else 0.45f))
             }
             Box(modifier = Modifier.padding(start = 10.dp, end = 16.dp)) { RuleCheck(hidden, enabled) }
+        }
+        if (needsMoveButtons) {
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(text = "上移", onClick = { onMoveUp?.invoke() }, enabled = onMoveUp != null,
+                    modifier = Modifier.weight(1f))
+                TextButton(text = "下移", onClick = { onMoveDown?.invoke() }, enabled = onMoveDown != null,
+                    modifier = Modifier.weight(1f))
+            }
         }
     }
 }

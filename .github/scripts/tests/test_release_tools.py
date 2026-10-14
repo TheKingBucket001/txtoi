@@ -11,10 +11,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import subprocess
+import sys
+import warnings
 import zipfile
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS))
 
 
 def load_script(name):
@@ -26,6 +29,95 @@ def load_script(name):
 
 apk_check = load_script("verify_release_apk")
 publication = load_script("publish_release")
+source_identity = load_script("source_identity")
+
+
+def make_source_tree(root):
+    for relative in source_identity.REQUIRED_INPUTS:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"binary-wrapper-fixture" if relative.endswith(".jar") else b"// production input\n")
+    target = root / "app/src/main/AndroidManifest.xml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes("<manifest label='菜单'/>\n".encode("utf-8"))
+
+
+class ProductionSourceIdentityTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        make_source_tree(self.root)
+
+    def identity(self, variant="release", r8_candidate=False):
+        return source_identity.build_identity(self.root, variant, r8_candidate)
+
+    def test_production_content_change_changes_the_identity(self):
+        before = self.identity()
+        (self.root / "app/src/main/AndroidManifest.xml").write_text("<manifest changed='true'/>\n", encoding="utf-8")
+        self.assertNotEqual(before, self.identity())
+
+    def test_text_line_endings_and_checkout_path_do_not_change_identity(self):
+        other = self.root / "other-checkout"
+        make_source_tree(other)
+        for path in source_identity.production_inputs(other):
+            if path.suffix.removeprefix(".") in source_identity.TEXT_EXTENSIONS:
+                path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        self.assertEqual(self.identity(), source_identity.build_identity(other, "release", False))
+
+    def test_source_identity_python_line_endings_are_normalized(self):
+        other = self.root / "python-crlf-checkout"
+        make_source_tree(other)
+        path = other / ".github/scripts/source_identity.py"
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        self.assertEqual(self.identity(), source_identity.build_identity(other, "release", False))
+        for path in source_identity.production_inputs(other):
+            if path.suffix.removeprefix(".") in source_identity.TEXT_EXTENSIONS:
+                path.write_bytes(path.read_bytes().replace(b"\r\n", b"\r"))
+        self.assertEqual(self.identity(), source_identity.build_identity(other, "release", False))
+
+    def test_variant_and_actual_r8_parameters_change_the_identity(self):
+        identities = {self.identity(variant, r8) for variant in ("debug", "release") for r8 in (False, True)}
+        self.assertEqual(len(identities), 3)
+        self.assertEqual(self.identity("debug", False), self.identity("debug", True))
+        self.assertEqual(source_identity.identity_record(self.root, "debug", False),
+                         source_identity.identity_record(self.root, "debug", True))
+        self.assertFalse(source_identity.identity_record(self.root, "debug", True)["r8Candidate"])
+
+    def test_nonproduction_files_do_not_change_identity(self):
+        before = self.identity()
+        for relative in ("README.md", "app/src/test/Test.kt", ".local/qa/result.json", "app/build/outputs/generated.txt"):
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"not a production input")
+        self.assertEqual(before, self.identity())
+
+    def test_missing_required_input_is_rejected(self):
+        (self.root / "gradle/wrapper/gradle-wrapper.jar").unlink()
+        with self.assertRaisesRegex(ValueError, "Required production input"):
+            self.identity()
+
+    def test_new_resource_and_optional_dependency_catalog_change_identity(self):
+        before = self.identity()
+        path = self.root / "app/src/main/res/raw/example.bin"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"new resource")
+        with_resource = self.identity()
+        self.assertNotEqual(before, with_resource)
+        path = self.root / "gradle/libs.versions.toml"
+        path.write_bytes(b"[versions]\nexample='1.0'\n")
+        self.assertNotEqual(with_resource, self.identity())
+
+    def test_source_identity_definition_and_wrapper_bytes_are_inputs(self):
+        before = self.identity()
+        path = self.root / ".github/scripts/source_identity.py"
+        path.write_bytes(path.read_bytes() + b"# definition changed\n")
+        changed_definition = self.identity()
+        self.assertNotEqual(before, changed_definition)
+        (self.root / "gradle/wrapper/gradle-wrapper.jar").write_bytes(b"wrapper\r\n")
+        binary_crlf = self.identity()
+        (self.root / "gradle/wrapper/gradle-wrapper.jar").write_bytes(b"wrapper\n")
+        self.assertNotEqual(binary_crlf, self.identity())
 
 
 class ApkIdentityTest(unittest.TestCase):
@@ -33,6 +125,8 @@ class ApkIdentityTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
+        self.source_root = self.directory / "source"
+        make_source_tree(self.source_root)
         self.apk = self.directory / "txtoi-v0.7.0.apk"
         self.metadata = self.directory / "output-metadata.json"
         self.metadata.write_text(json.dumps({"applicationId": apk_check.APPLICATION_ID, "elements": [{"versionCode": 18, "versionName": "0.7.0"}]}), encoding="utf-8")
@@ -40,25 +134,73 @@ class ApkIdentityTest(unittest.TestCase):
         self.badging = f"package: name='{apk_check.APPLICATION_ID}' versionCode='18' versionName='0.7.0' platformBuildVersionName='16'\n"
         self.make_apk()
 
-    def make_apk(self, scope="system", entry=apk_check.ENTRY_POINT, properties="staticScope=true\n", legacy=False):
+    def make_apk(self, scope="system", entry=apk_check.ENTRY_POINT, properties="staticScope=true\n", legacy=False,
+                 include_source=True, identity=None):
         with zipfile.ZipFile(self.apk, "w") as archive:
             archive.writestr("META-INF/xposed/scope.list", scope)
             archive.writestr("META-INF/xposed/java_init.list", entry)
             archive.writestr("META-INF/xposed/module.prop", properties)
+            if include_source:
+                archive.writestr(apk_check.SOURCE_IDENTITY_ASSET,
+                                 identity if isinstance(identity, bytes) else json.dumps(
+                                     source_identity.identity_record(self.source_root) if identity is None else identity))
             if legacy:
                 archive.writestr("assets/xposed_init", entry)
 
     def run_tool(self, arguments):
         return self.signer if arguments[1] == "verify" else self.badging
 
-    def verify(self, tag="v0.7.0"):
-        return apk_check.verify_apk(self.apk, self.metadata, tag, self.directory, runner=self.run_tool)
+    def verify(self, tag="v0.7.0", r8_candidate=False):
+        return apk_check.verify_apk(self.apk, self.metadata, tag, self.directory, self.source_root,
+                                    r8_candidate, runner=self.run_tool)
 
     def test_valid_release_identity_and_digest(self):
         result = self.verify()
         self.assertEqual(result["version_code"], 18)
         self.assertEqual(result["version_name"], "0.7.0")
         self.assertEqual(result["apk_sha256"], hashlib.sha256(self.apk.read_bytes()).hexdigest())
+        self.assertEqual(result["probe_build_id"], source_identity.build_identity(self.source_root, "release", False))
+
+    def test_same_version_from_changed_production_source_is_rejected(self):
+        (self.source_root / "app/src/main/AndroidManifest.xml").write_text("<manifest changed='true'/>\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "production source identity does not match"):
+            self.verify()
+
+    def test_missing_source_identity_is_rejected(self):
+        self.make_apk(include_source=False)
+        with self.assertRaisesRegex(ValueError, "unique production source identity"):
+            self.verify()
+
+    def test_wrong_source_identity_or_build_parameters_are_rejected(self):
+        original = source_identity.identity_record(self.source_root)
+        for field, value in (("buildId", "0" * 64), ("variant", "debug"), ("r8Candidate", True)):
+            with self.subTest(field=field):
+                self.make_apk(identity=dict(original, **{field: value}))
+                with self.assertRaisesRegex(ValueError, "production source identity does not match"):
+                    self.verify()
+        self.make_apk()
+        with self.assertRaisesRegex(ValueError, "production source identity does not match"):
+            self.verify(r8_candidate=True)
+
+    def test_malformed_source_identity_is_rejected(self):
+        original = source_identity.identity_record(self.source_root)
+        for record in (b"not-json", b"\xff", [], dict(original, schema=True), dict(original, r8Candidate=0),
+                       dict(original, buildId="bad"), dict(original, extra="untrusted")):
+            with self.subTest(record=record):
+                self.make_apk(identity=record)
+                with self.assertRaisesRegex(ValueError, "source identity"):
+                    self.verify()
+
+    def test_duplicate_source_assets_and_fields_are_rejected(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(self.apk, "a") as archive:
+                archive.writestr(apk_check.SOURCE_IDENTITY_ASSET, "{}")
+        with self.assertRaisesRegex(ValueError, "unique production source identity"):
+            self.verify()
+        self.make_apk(identity=b'{"schema":1,"schema":1}')
+        with self.assertRaisesRegex(ValueError, "duplicate fields"):
+            self.verify()
 
     def test_rejects_changed_signing_certificate(self):
         self.signer = self.signer.replace(apk_check.CERTIFICATE_SHA256, "0" * 64)

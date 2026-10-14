@@ -14,10 +14,15 @@ import zipfile
 PACKAGE = "io.github.selectionmenucontrol."
 ENTRY_NAMES = ("SelectionMenuModule", "EnvironmentViewModel", "UpdateViewModel", "RuleEditorViewModel")
 MODULE_DESCRIPTOR = "Lio/github/selectionmenucontrol/SelectionMenuModule;"
+XPOSED_BASE = "Lio/github/libxposed/api/XposedModule;"
+OBJECT_DESCRIPTOR = "Ljava/lang/Object;"
+ORIGINAL_CLASSES = {name: PACKAGE + name for name in ENTRY_NAMES}
+ORIGINAL_CLASSES.update({"AndroidViewModel": "androidx.lifecycle.AndroidViewModel", "ViewModel": "androidx.lifecycle.ViewModel"})
 PUBLIC = 0x0001
 PRIVATE = 0x0002
 PROTECTED = 0x0004
 STATIC = 0x0008
+INTERFACE = 0x0200
 ABSTRACT = 0x0400
 CONSTRUCTOR = 0x10000
 MAX_DEX_BYTES = 256 * 1024 * 1024
@@ -49,7 +54,7 @@ def sha256_file(path):
 
 def mapped_descriptors(mapping):
     """Read class mappings, never method lines or arbitrary occurrences of a name."""
-    expected = {PACKAGE + name for name in ENTRY_NAMES}
+    expected = set(ORIGINAL_CLASSES.values())
     mapped = {}
     for line in mapping.splitlines():
         match = re.fullmatch(r"(\S+) -> (\S+):", line)
@@ -64,7 +69,11 @@ def mapped_descriptors(mapping):
     require(len(set(mapped.values())) == len(expected), "Required entry classes share a mapped descriptor")
     require(mapped[PACKAGE + "SelectionMenuModule"] == MODULE_DESCRIPTOR,
             "Modern module class must retain its literal name")
-    return {name: mapped[PACKAGE + name] for name in ENTRY_NAMES}
+    return {name: mapped[original] for name, original in ORIGINAL_CLASSES.items()}
+
+
+def is_class_descriptor(value):
+    return re.fullmatch(r"L(?:[^.;\[\s/]+/)*[^.;\[\s/]+;", value) is not None
 
 
 def parse_dexdump(output):
@@ -77,8 +86,10 @@ def parse_dexdump(output):
         flags = re.search(r"(?m)^  Access flags\s+: 0x([0-9a-fA-F]+)(?:\s+\([^\r\n]*\))?\s*$", block)
         require(descriptor is not None and flags is not None, "Malformed dexdump class record")
         name = descriptor[1]
-        require(name.startswith("L") and name.endswith(";") and "." not in name,
-                "Invalid DEX class descriptor")
+        require(is_class_descriptor(name), "Invalid DEX class descriptor")
+        superclasses = re.findall(r"(?m)^  Superclass\s+: '([^']+)'\s*$", block)
+        require(len(superclasses) == 1 and is_class_descriptor(superclasses[0]),
+                f"Missing or ambiguous DEX superclass in {name}")
         require(name not in classes, f"Duplicate DEX class {name}")
         methods = {}
         sections = re.finditer(r"(?ms)^  (?:Direct|Virtual) methods\s+-\s*\n(.*?)(?=^  (?:Direct|Virtual) methods\s+-|^  source_file_idx|\Z)", block)
@@ -93,8 +104,26 @@ def parse_dexdump(output):
                 key = (method_name[1], signature[1])
                 require(key not in methods, f"Duplicate DEX method in {name}: {key}")
                 methods[key] = int(access[1], 16)
-        classes[name] = {"access": int(flags[1], 16), "methods": methods}
+        classes[name] = {"access": int(flags[1], 16), "methods": methods, "superclass": superclasses[0]}
     return classes
+
+
+def class_lineage(descriptor, classes):
+    """Walk the full chain, allowing only the two known runtime-provided roots."""
+    lineage = []
+    seen = set()
+    current = descriptor
+    while True:
+        require(current not in seen, f"Cyclic DEX superclass chain for {descriptor}")
+        seen.add(current)
+        lineage.append(current)
+        if current not in classes:
+            require(current in (OBJECT_DESCRIPTOR, XPOSED_BASE),
+                    f"Missing superclass chain for {descriptor}: {current}")
+            return lineage
+        require(not classes[current]["access"] & INTERFACE,
+                f"Superclass chain contains an interface for {descriptor}: {current}")
+        current = classes[current]["superclass"]
 
 
 def run_dexdump(arguments):
@@ -132,11 +161,24 @@ def verify_entrypoints(apk, mapping_path, dexdump, runner=run_dexdump):
             classes.update(parsed)
         dex_files = [entries[index].filename for index in sorted(entries)]
     verified = {}
-    for name, descriptor in descriptors.items():
+    require(XPOSED_BASE not in classes, "APK must not shadow the runtime-provided XposedModule")
+    for name in ("AndroidViewModel", "ViewModel"):
+        require(descriptors[name] in classes, f"Missing mapped ViewModel base class {name}")
+    base_lineages = {name: class_lineage(descriptors[name], classes) for name in ("AndroidViewModel", "ViewModel")}
+    require(descriptors["ViewModel"] in base_lineages["AndroidViewModel"][1:],
+            "Mapped AndroidViewModel is not assignable to mapped ViewModel")
+    require(base_lineages["ViewModel"][-1] == OBJECT_DESCRIPTOR,
+            "Mapped ViewModel must end at java.lang.Object")
+    for name in ENTRY_NAMES:
+        descriptor = descriptors[name]
         require(descriptor in classes, f"Missing DEX entry class {name}: {descriptor}")
         entry = classes[descriptor]
         require(entry["access"] & PUBLIC and not entry["access"] & (PRIVATE | PROTECTED | ABSTRACT),
                 f"Entry class {name} must be public and concrete")
+        lineage = class_lineage(descriptor, classes)
+        required_base = XPOSED_BASE if name == "SelectionMenuModule" else descriptors[
+            "ViewModel" if name == "RuleEditorViewModel" else "AndroidViewModel"]
+        require(required_base in lineage[1:], f"Entry class {name} is not assignable to its required base {required_base}")
         checked_methods = []
         for method, signature in REQUIRED_METHODS[name]:
             flags = entry["methods"].get((method, signature))
@@ -146,9 +188,11 @@ def verify_entrypoints(apk, mapping_path, dexdump, runner=run_dexdump):
             require(method != "<init>" or flags & CONSTRUCTOR,
                     f"Required constructor {name}{signature} lacks its DEX constructor flag")
             checked_methods.append({"name": method, "descriptor": signature})
-        verified[name] = {"descriptor": descriptor, "methods": checked_methods}
+        verified[name] = {"descriptor": descriptor, "methods": checked_methods, "ancestors": lineage[1:]}
     return {"apk_sha256": sha256_file(apk), "mapping_sha256": sha256_file(mapping_path),
-            "dex_files": dex_files, "entrypoints": verified}
+            "dex_files": dex_files, "entrypoints": verified,
+            "viewmodel_bases": {name: {"descriptor": descriptors[name], "ancestors": lineage[1:]}
+                                for name, lineage in base_lineages.items()}}
 
 
 def main():

@@ -182,8 +182,12 @@ public final class SelectionMenuModule extends XposedModule {
     }
 
     private static boolean isOriginalQuery(Intent intent) {
+        return isTrustedModuleQuery(intent, SystemRuleStore.QUERY_ORIGINAL_EXTRA);
+    }
+
+    private static boolean isTrustedModuleQuery(Intent intent, String extraKey) {
         try {
-            if (!intent.getBooleanExtra(SystemRuleStore.QUERY_ORIGINAL_EXTRA, false)) {
+            if (!intent.getBooleanExtra(extraKey, false)) {
                 return false;
             }
             int callingAppId = Binder.getCallingUid() % 100_000;
@@ -201,7 +205,7 @@ public final class SelectionMenuModule extends XposedModule {
                     Binder.restoreCallingIdentity(identity);
                 }
             }
-            // Only the module UI may enumerate the original list, including hidden activities.
+            // Extra-based privileged query paths are accepted only from the module app.
             return callingAppId == appId;
         } catch (Throwable ignored) {
             return false;
@@ -235,12 +239,12 @@ public final class SelectionMenuModule extends XposedModule {
         return SystemRuleStore.read(context);
     }
 
-    private void respondToProbe(boolean trustedOriginalQuery) {
+    private void respondToProbe(boolean trustedModuleQuery) {
         synchronized (SelectionMenuModule.class) {
             long now = SystemClock.elapsedRealtime();
             // Only the verified module caller bypasses polling. Its environment check must
             // not depend on delivery of a ContentObserver callback on the system main thread.
-            if (!trustedOriginalQuery && !probePending && now < nextProbePollAt) return;
+            if (!trustedModuleQuery && !probePending && now < nextProbePollAt) return;
             nextProbePollAt = now + (observersRegistered ? 30_000L : RULE_CACHE_MS);
             probePending = false;
             Context context = getSystemContext();

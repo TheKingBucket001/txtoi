@@ -14,9 +14,13 @@ final class ModuleDiagnostics {
         BACKUP_FAILED, JOURNAL_FAILED, JOURNAL_CONFLICT, POLICY_UNAVAILABLE,
         POLICY_FAILED, QUERY_FAILED, PROBE_FAILED, CACHE_INVALIDATED, UPDATE_FAILED,
         ROOT_DENIED, ROOT_UNAVAILABLE, ROOT_LOCKED, ROOT_EXPIRED, ROOT_STALE,
-        ROOT_STORAGE, ROOT_WRITE, ROOT_VERIFY, ROOT_PROTOCOL, ROOT_IO, ROOT_INTERRUPTED
+        ROOT_STORAGE, ROOT_WRITE, ROOT_VERIFY, ROOT_PROTOCOL, ROOT_IO, ROOT_INTERRUPTED,
+        PROBE_READ_FAILED, PROBE_INCOMPATIBLE, PROBE_EXPIRED, PROBE_INVALID,
+        PROBE_NO_RESPONSE, PROBE_CLEANUP_FAILED, PROBE_PREPARATION_FAILED, PROBE_QUERY_FAILED
     }
-    enum Metric { QUERY_MS, POLICY_MS, POLICY_CACHE_HIT, POLICY_BACKOFF_HIT, RULE_CACHE_HIT, ROOT_MS, SAVE_MS, QUEUE_DEPTH }
+    enum Metric { QUERY_MS, POLICY_MS, POLICY_CACHE_HIT, POLICY_BACKOFF_HIT, RULE_CACHE_HIT, ROOT_MS, SAVE_MS,
+        QUEUE_DEPTH, PROBE_PREPARE_MS, PROBE_QUERY_MS, PROBE_RESPONSE_MS, PROBE_CLEANUP_MS }
+    enum EventPhase { EVENT, FAULT, RECOVERY }
     private static final ModuleDiagnostics INSTANCE = new ModuleDiagnostics(() -> System.nanoTime() / 1_000_000L);
     static final int MAX_EVENTS = 64;
     static final int MAX_OUTPUT = 16 * 1024;
@@ -47,7 +51,7 @@ final class ModuleDiagnostics {
         counts.put(code, count == Long.MAX_VALUE ? count : count + 1);
         boolean first = active.add(code);
         refreshBudget();
-        if (first) addEvent(code, 0, 0);
+        if (first) addEvent(EventPhase.FAULT, code, 0, 0);
         if (!Long.valueOf(windowStarted).equals(faultWindows.get(code))) {
             if (emit(true, code.name() + " count=" + counts.get(code))) faultWindows.put(code, windowStarted);
         }
@@ -55,7 +59,7 @@ final class ModuleDiagnostics {
     synchronized void recovered(Code code) {
         if (active.remove(code)) {
             refreshBudget();
-            addEvent(code, 0, 0);
+            addEvent(EventPhase.RECOVERY, code, 0, 0);
             if (!Long.valueOf(windowStarted).equals(recoveryWindows.get(code))
                     && emit(false, code.name() + " recovered count=" + counts.getOrDefault(code, 0L))) {
                 recoveryWindows.put(code, windowStarted);
@@ -63,8 +67,11 @@ final class ModuleDiagnostics {
         }
     }
     synchronized void addEvent(Code code, long operation, long elapsedMs) {
+        addEvent(EventPhase.EVENT, code, operation, elapsedMs);
+    }
+    private void addEvent(EventPhase phase, Code code, long operation, long elapsedMs) {
         if (events.size() == MAX_EVENTS) events.removeFirst();
-        events.addLast(clock.getAsLong() + " " + code.name() + " op=" + Math.max(0, operation)
+        events.addLast(clock.getAsLong() + " phase=" + phase.name() + " " + code.name() + " op=" + Math.max(0, operation)
                 + " ms=" + Math.max(0, elapsedMs));
     }
     synchronized void measure(Metric metric, long value) {

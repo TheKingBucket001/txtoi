@@ -76,11 +76,10 @@ final class RootCommandProtocol {
     }
 
     static String probe(String requestKey, String responseKey, String requestPrefix,
-                        String pendingValue, long revisionNanos, long deadlineMillis) {
+                        long revisionNanos, long deadlineMillis) {
         if (!validKey(requestKey) || !validKey(responseKey) || requestKey.equals(responseKey)
                 || !validValue(requestPrefix) || !requestPrefix.endsWith(":")
-                || requestPrefix.length() > 512 || !validValue(pendingValue)
-                || pendingValue.length() > 512 || !validClock(revisionNanos, deadlineMillis)) {
+                || requestPrefix.length() > 512 || !validClock(revisionNanos, deadlineMillis)) {
             return null;
         }
         StringBuilder command = begin(revisionNanos, deadlineMillis);
@@ -88,10 +87,8 @@ final class RootCommandProtocol {
         fence(command, responseKey);
         mark(command, requestKey);
         mark(command, responseKey);
-        deadline(command);
-        command.append("/system/bin/settings put global ").append(responseKey).append(" '")
-                .append(pendingValue).append("' >/dev/null 2>&1 || exit ")
-                .append(WRITE_FAILED).append(";\n");
+        // A fresh nonce rejects every older response. Do not create an ownerless pending
+        // value that prefix cleanup cannot remove when the hook is unavailable.
         // Authorization can be slow. Generate the timestamp immediately before request commit.
         deadline(command);
         command.append("request='").append(requestPrefix).append("'\"$now_ms\";\n")
@@ -121,7 +118,10 @@ final class RootCommandProtocol {
             command.append("current=\"$(/system/bin/settings get global ").append(key)
                     .append(" 2>/dev/null)\" || exit ").append(PROTOCOL_FAILED).append(";\n")
                     .append("case \"$current\" in '").append(prefix)
-                    .append("'*) /system/bin/settings delete global ").append(key)
+                    .append("'*)\n");
+            // A slow settings read may outlive the deadline. Check again before a new delete.
+            deadline(command);
+            command.append("/system/bin/settings delete global ").append(key)
                     .append(" >/dev/null 2>&1 || exit ").append(WRITE_FAILED)
                     .append(";; esac;\n");
         }
@@ -135,6 +135,7 @@ final class RootCommandProtocol {
     private static StringBuilder begin(long revisionNanos, long deadlineMillis) {
         StringBuilder command = new StringBuilder(1200);
         command.append("umask 077;\n")
+                .append("LC_ALL=C; export LC_ALL;\n")
                 .append("[ -x /system/bin/flock ] || exit ").append(PROTOCOL_FAILED).append(";\n")
                 .append("directory='").append(DIRECTORY).append("';\n")
                 .append("[ ! -L \"$directory\" ] || exit ").append(STORAGE_FAILED).append(";\n")
@@ -142,9 +143,11 @@ final class RootCommandProtocol {
                 .append(STORAGE_FAILED).append(";\n")
                 .append("/system/bin/chmod 700 \"$directory\" >/dev/null 2>&1 || exit ")
                 .append(STORAGE_FAILED).append(";\n")
-                .append("exec 9>\"$directory/transaction.lock\" || exit ")
+                // Android's shell closes extra descriptors before starting Toybox. Use stdin,
+                // which remains inherited, as the shared lock descriptor.
+                .append("exec 0<>\"$directory/transaction.lock\" || exit ")
                 .append(STORAGE_FAILED).append(";\n")
-                .append("/system/bin/flock -n 9 >/dev/null 2>&1 || exit ").append(LOCK_BUSY)
+                .append("/system/bin/flock -n 0 >/dev/null 2>&1 || exit ").append(LOCK_BUSY)
                 .append(";\n")
                 .append("IFS= read -r boot < /proc/sys/kernel/random/boot_id || exit ")
                 .append(PROTOCOL_FAILED).append(";\n")
@@ -152,11 +155,20 @@ final class RootCommandProtocol {
                 .append(PROTOCOL_FAILED).append(";; esac;\n")
                 .append("[ \"${#boot}\" -eq 36 ] || exit ").append(PROTOCOL_FAILED).append(";\n")
                 .append("revision=").append(revisionNanos).append(";\n")
-                .append("deadline_ms=").append(deadlineMillis).append(";\n")
+                // Android mksh arithmetic and numeric test operands wrap at 32 bits.
+                // Compare canonical decimal strings, converting only their small lengths.
+                .append("decimal_lt() { [ \"${#1}\" -lt \"${#2}\" ] && return 0; ")
+                .append("[ \"${#1}\" -eq \"${#2}\" ] && [ \"$1\" '<' \"$2\" ]; };\n")
+                // Moving the 10 ms margin into Java preserves now_ms + 10 < deadline
+                // without overflowing shell arithmetic after 24.8 days of uptime.
+                .append("latest_start_ms=").append(Math.max(0L, deadlineMillis - 10L)).append(";\n")
                 .append("clock_now() { IFS=' .' read -r seconds centis ignored < /proc/uptime || return 1; ")
                 .append("case \"$seconds\" in ''|*[!0-9]*) return 1;; esac; ")
                 .append("case \"$centis\" in [0-9][0-9]) ;; *) return 1;; esac; ")
-                .append("now_ms=$((seconds * 1000 + (1$centis - 100) * 10)); };\n");
+                .append("now_ms=\"$seconds$centis\"0; ")
+                .append("while :; do case \"$now_ms\" in 0?*) now_ms=${now_ms#0};; *) break;; esac; done; ")
+                .append("[ \"${#now_ms}\" -le 19 ] || return 1; ")
+                .append("! decimal_lt 9223372036854775807 \"$now_ms\"; };\n");
         deadline(command);
         return command;
     }
@@ -164,7 +176,7 @@ final class RootCommandProtocol {
     private static void deadline(StringBuilder command) {
         command.append("clock_now || exit ").append(PROTOCOL_FAILED).append(";\n")
                 // /proc/uptime has centisecond resolution. Reject up to 10 ms early, never late.
-                .append("[ \"$((now_ms + 10))\" -lt \"$deadline_ms\" ] || exit ")
+                .append("decimal_lt \"$now_ms\" \"$latest_start_ms\" || exit ")
                 .append(EXPIRED).append(";\n");
     }
 
@@ -178,9 +190,10 @@ final class RootCommandProtocol {
                 .append("case \"$previous_revision\" in ''|0*|*[!0-9]*) exit ")
                 .append(PROTOCOL_FAILED).append(";; esac;\n")
                 .append("[ \"${#previous_revision}\" -le 19 ] || exit ").append(PROTOCOL_FAILED).append(";\n")
-                .append("[ \"$previous_revision\" -gt 0 ] 2>/dev/null || exit ").append(PROTOCOL_FAILED).append(";\n")
+                .append("! decimal_lt 9223372036854775807 \"$previous_revision\" || exit ")
+                .append(PROTOCOL_FAILED).append(";\n")
                 .append("[ -z \"$extra\" ] || exit ").append(PROTOCOL_FAILED).append(";\n")
-                .append("if [ \"$previous_boot\" = \"$boot\" ] && [ \"$previous_revision\" -ge \"$revision\" ]; then exit ")
+                .append("if [ \"$previous_boot\" = \"$boot\" ] && ! decimal_lt \"$previous_revision\" \"$revision\"; then exit ")
                 .append(STALE_REVISION).append("; fi; fi;\n");
     }
 

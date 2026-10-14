@@ -40,6 +40,10 @@ jobs:
           log-accepted-android-sdk-licenses: false
       - name: Install Android platform and verification tools
         run: sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0'
+      - name: Install Android-compatible test shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y mksh
       - name: Make Gradle wrapper executable
         run: |
           printf '%s\n' '497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7  gradle/wrapper/gradle-wrapper.jar' | sha256sum --check --strict
@@ -72,6 +76,8 @@ jobs:
           else
             ./gradlew :app:lintDebug :app:testDebugUnitTest :app:verifyModernXposedMetadata --dependency-verification=strict --no-daemon
           fi
+      - name: Test with Android mksh semantics
+        run: ./gradlew :app:testDebugUnitTest -ProotProtocolTestShell=/bin/mksh --dependency-verification=strict --no-daemon
       - name: Verify release APK identity
         id: release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -80,7 +86,7 @@ jobs:
           apk_name="txtoi-${GITHUB_REF_NAME}.apk"
           apk="app/build/outputs/apk/release/$apk_name"
           cp app/build/outputs/apk/release/app-release.apk "$apk"
-          python3 .github/scripts/verify_release_apk.py --apk "$apk" --metadata app/build/outputs/apk/release/output-metadata.json --tag "$GITHUB_REF_NAME" --build-tools "$ANDROID_HOME/build-tools/36.0.0" --github-output "$GITHUB_OUTPUT"
+          python3 .github/scripts/verify_release_apk.py --apk "$apk" --metadata app/build/outputs/apk/release/output-metadata.json --tag "$GITHUB_REF_NAME" --build-tools "$ANDROID_HOME/build-tools/36.0.0" --source-root "$GITHUB_WORKSPACE" --r8-candidate true --github-output "$GITHUB_OUTPUT"
       - name: Upload verified release APK
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

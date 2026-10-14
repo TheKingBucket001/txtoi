@@ -1,5 +1,6 @@
 import java.util.Properties
 import java.util.zip.ZipFile
+import java.security.MessageDigest
 
 plugins {
     id("com.android.application")
@@ -17,11 +18,57 @@ val releaseKeyAlias = signingProperties.getProperty("keyAlias") ?: System.getenv
 val releaseKeyPassword = signingProperties.getProperty("keyPassword") ?: System.getenv("ANDROID_KEY_PASSWORD")
 val releaseSigningReady = listOf(releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword)
     .all { !it.isNullOrBlank() }
-// Keep production packaging unchanged until the candidate has passed device checks.
+// Production releases use R8. Pass -Pr8Candidate=false only for an explicit local
+// fallback build; the release identity records the effective value.
 val r8Candidate = providers.gradleProperty("r8Candidate").map { value ->
     require(value == "true" || value == "false") { "r8Candidate must be true or false" }
     value.toBoolean()
-}.getOrElse(false)
+}.getOrElse(true)
+
+// Content identity includes dirty production inputs, never signing files, QA or outputs.
+// Normalize text line endings so identical Windows and Linux checkouts agree.
+val probeIdentityRequired = listOf(
+    "app/build.gradle.kts", "app/proguard-rules.pro", "build.gradle.kts", "settings.gradle.kts",
+    "gradle.properties", "gradle/verification-metadata.xml", "gradle/wrapper/gradle-wrapper.properties",
+    "gradle/wrapper/gradle-wrapper.jar", ".github/scripts/source_identity.py",
+).map(rootProject::file)
+probeIdentityRequired.forEach { check(it.isFile) { "Production identity input is missing: ${it.name}" } }
+val probeIdentityOptional = rootProject.file("gradle/libs.versions.toml").let { if (it.isFile) listOf(it) else emptyList() }
+val probeIdentityInputs = (rootProject.fileTree("app/src/main").files + probeIdentityRequired + probeIdentityOptional)
+    .sortedBy { it.relativeTo(rootProject.projectDir).invariantSeparatorsPath }
+fun probeBuildIdentity(variant: String): String {
+    val actualR8 = variant == "release" && r8Candidate
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update("txtoi-probe-build-v1\n$variant\nr8=$actualR8\n".toByteArray(Charsets.UTF_8))
+    for (input in probeIdentityInputs) {
+        val relative = input.relativeTo(rootProject.projectDir).invariantSeparatorsPath
+        val text = input.extension in setOf("java", "kt", "kts", "xml", "pro", "properties", "prop", "list", "txt", "json", "toml", "py")
+        val bytes = if (text) input.readText(Charsets.UTF_8).replace("\r\n", "\n").replace("\r", "\n").toByteArray(Charsets.UTF_8)
+            else input.readBytes()
+        digest.update("$relative\n${bytes.size}\n".toByteArray(Charsets.UTF_8))
+        digest.update(bytes)
+        digest.update(0.toByte())
+    }
+    return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+}
+
+abstract class WriteProbeIdentity : DefaultTask() {
+    @get:org.gradle.api.tasks.Input
+    abstract val buildId: org.gradle.api.provider.Property<String>
+    @get:org.gradle.api.tasks.Input
+    abstract val variantName: org.gradle.api.provider.Property<String>
+    @get:org.gradle.api.tasks.Input
+    abstract val r8Enabled: org.gradle.api.provider.Property<Boolean>
+    @get:org.gradle.api.tasks.OutputDirectory
+    abstract val outputDirectory: org.gradle.api.file.DirectoryProperty
+
+    @org.gradle.api.tasks.TaskAction
+    fun writeIdentity() {
+        val destination = outputDirectory.get().asFile.resolve("probe-build.json")
+        destination.parentFile.mkdirs()
+        destination.writeText("{\"schema\":1,\"variant\":\"${variantName.get()}\",\"r8Candidate\":${r8Enabled.get()},\"buildId\":\"${buildId.get()}\"}\n", Charsets.UTF_8)
+    }
+}
 
 android {
     namespace = "io.github.selectionmenucontrol"
@@ -47,7 +94,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            buildConfigField("String", "PROBE_BUILD_ID", "\"${probeBuildIdentity("debug")}\"")
+        }
         release {
+            buildConfigField("String", "PROBE_BUILD_ID", "\"${probeBuildIdentity("release")}\"")
             isMinifyEnabled = r8Candidate
             isShrinkResources = r8Candidate
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -72,6 +123,27 @@ android {
         disable += "GradleDependency"
         disable += "OldTargetApi"
     }
+}
+
+androidComponents.onVariants { variant ->
+    val identity = tasks.register<WriteProbeIdentity>("write${variant.name.replaceFirstChar { it.uppercaseChar() }}ProbeIdentity") {
+        buildId.set(probeBuildIdentity(variant.name))
+        variantName.set(variant.name)
+        r8Enabled.set(variant.buildType == "release" && r8Candidate)
+        outputDirectory.set(layout.buildDirectory.dir("generated/probeIdentity/${variant.name}"))
+    }
+    variant.sources.assets?.addGeneratedSourceDirectory(identity, WriteProbeIdentity::outputDirectory)
+}
+
+val rootProtocolTestShell = providers.gradleProperty("rootProtocolTestShell").orNull?.let { path ->
+    rootProject.file(path).also { shell ->
+        check(shell.isFile) { "rootProtocolTestShell must name an existing shell executable: $path" }
+    }.absolutePath
+}
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    // The selected shell is an explicit input so changing it reruns cached host tests.
+    inputs.property("rootProtocolTestShell", rootProtocolTestShell.orEmpty())
+    rootProtocolTestShell?.let { shell -> systemProperty("selectionmenu.rootProtocolTestShell", shell) }
 }
 
 tasks.matching { it.name == "packageRelease" }.configureEach {

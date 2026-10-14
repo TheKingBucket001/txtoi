@@ -50,4 +50,49 @@ class PendingJournalRecordTest {
         assertEquals(PendingJournalRead.Failed, pendingRecoveryRecord(PendingJournalRead.Failed, remembered, "target"))
         assertEquals(PendingJournalRead.Missing, pendingRecoveryRecord(PendingJournalRead.Missing, remembered, null))
     }
+
+    @Test fun twoAcceptedDraftsBeforeAnyDurableStageKeepTheOriginalBaseline() {
+        val original = empty
+        val firstDraft = RuleConfig(setOf("p/p.First"), emptyList()).encode()
+        val latestDraft = RuleConfig(setOf("p/p.Latest"), emptyList()).encode()
+        // Both Global reads failed while the journal was Missing. The second UI snapshot is a draft.
+        val first = nextPendingJournalRecord("first", null, null, original, firstDraft)
+        val latest = nextPendingJournalRecord("latest", null, first, firstDraft, latestDraft)
+        val recovered = (pendingRecoveryRecord(PendingJournalRead.Missing, latest, latestDraft)
+            as PendingJournalRead.Found).record
+        assertEquals(original, recovered.baseline)
+        assertEquals(latestDraft, recovered.target)
+        assertEquals(PendingRuleRecovery.Action.REPLAY,
+            PendingRuleRecovery.decide(recovered.baseline, recovered.target, recovered.inFlight, original, true))
+        // Counterexample for the previous stage logic: rebasing to the first draft loses the latest edit.
+        assertEquals(PendingRuleRecovery.Action.CONFLICT,
+            PendingRuleRecovery.decide(firstDraft, latestDraft, null, original, true))
+    }
+
+    @Test fun aGenuinelyMissingOriginalGlobalRemainsNullAcrossAcceptedDrafts() {
+        val first = nextPendingJournalRecord("first", null, null, null, "first-draft")
+        val latest = nextPendingJournalRecord("latest", null, first, "first-draft", "latest-draft")
+        assertEquals(null, latest.baseline)
+        assertEquals(PendingRuleRecovery.Action.REPLAY,
+            PendingRuleRecovery.decide(latest.baseline, latest.target, latest.inFlight, null, true))
+    }
+
+    @Test fun durableRecordWinsOverRememberedBaselineAndInFlight() {
+        val durable = PendingJournalRecord("disk", "disk-baseline", "disk-target", "disk-in-flight")
+        val remembered = PendingJournalRecord("memory", "memory-baseline", "memory-target", "memory-in-flight")
+        assertEquals(PendingJournalRecord("latest", "disk-baseline", "latest-draft", "disk-in-flight"),
+            nextPendingJournalRecord("latest", durable, remembered, "page-snapshot", "latest-draft"))
+    }
+
+    @Test fun rememberedInFlightSurvivesAMissingDurableRecord() {
+        val remembered = PendingJournalRecord("memory", "original", "first-draft", "in-flight")
+        assertEquals(PendingJournalRecord("latest", "original", "latest-draft", "in-flight"),
+            nextPendingJournalRecord("latest", null, remembered, "first-draft", "latest-draft"))
+    }
+
+    @Test fun retiredMemoryCannotRestoreAnOldTransaction() {
+        assertEquals(PendingJournalRecord("new", "new-global", "new-draft", null),
+            nextPendingJournalRecord("new", null, null, "new-global", "new-draft"))
+        assertEquals(PendingJournalRead.Missing, pendingRecoveryRecord(PendingJournalRead.Missing, null, null))
+    }
 }

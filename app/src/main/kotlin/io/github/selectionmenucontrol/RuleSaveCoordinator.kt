@@ -30,6 +30,7 @@ internal object RuleSaveCoordinator {
     private var acceptedDraft: SystemRuleStore.Snapshot? = null
     @Volatile private var stagedRecord: PendingJournalRecord? = null
     private var pendingCleanup: PendingJournalRecord? = null
+    private var discardRequested = false
     private var operation = 0L
     private val queue = RuleSaveQueue<SystemRuleStore.Snapshot>(
         scope = scope,
@@ -43,6 +44,7 @@ internal object RuleSaveCoordinator {
 
     fun initialize(appContext: Context, snapshot: SystemRuleStore.Snapshot, expected: RuleSaveState<SystemRuleStore.Snapshot>?) {
         context = appContext.applicationContext as Application
+        if (discardRequested) { discardUnsaved(); return }
         if (recoveryChecking.value) return
         queue.refresh(snapshot, expected)
         if (state.value?.pending == true) return
@@ -163,6 +165,59 @@ internal object RuleSaveCoordinator {
         }
     }
 
+    /** Explicit user confirmation only. This operation never writes Global or replays the draft. */
+    fun discardUnsaved() {
+        if (recoveryChecking.value) return
+        val observedState = state.value?.takeIf { !it.pending && it.verificationPending } ?: return
+        val latestStage = stage
+        discardRequested = true
+        recoveryChecking.value = true
+        scope.launch {
+            try {
+                // Join accepts a completed failed stage too; abandoning it needs no write receipt.
+                latestStage?.join()
+                if (state.value !== observedState || state.value?.pending == true) return@launch
+                val result = journalMutex.withLock {
+                    withContext(Dispatchers.IO) {
+                        discardPendingDraft(
+                            readGlobal = {
+                                val raw = SystemRuleStore.readRawGlobal(context)
+                                DiscardGlobalValue(raw.value, raw.valid)
+                            },
+                            readJournal = ::readJournal,
+                            verifyStable = { value ->
+                                RootAccess.verifyGlobalStableResult(SystemRuleStore.SETTING_KEY, value).success
+                            },
+                            clearJournal = { expected ->
+                                discardPendingJournal(discardJournalStorage(preferences()), expected)
+                            },
+                        )
+                    }
+                }
+                if (result !is DraftDiscardResult.Complete || state.value !== observedState) {
+                    ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED)
+                    queue.markUnresolved(observedState)
+                    return@launch
+                }
+                discardRequested = false
+                acceptedDraft = null
+                stagedRecord = null
+                pendingCleanup = null
+                recoveryTarget = null
+                recoveryBaseline = null
+                stage = null
+                lastUncertain = false
+                queue.resolve(SystemRuleStore.decode(result.current), observedState)
+                ModuleDiagnostics.recover(ModuleDiagnostics.Code.JOURNAL_FAILED)
+                withContext(Dispatchers.IO) { SystemRuleStore.repairBackup(context) }
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED)
+                queue.markUnresolved(observedState)
+            } finally { recoveryChecking.value = false }
+        }
+    }
+
     fun submit(snapshot: SystemRuleStore.Snapshot) {
         if (recoveryChecking.value || state.value?.verificationPending == true) return
         val encoded = try { snapshot.encode() } catch (_: IllegalArgumentException) {
@@ -183,8 +238,9 @@ internal object RuleSaveCoordinator {
                 val baseline = if (previous != null) previous.baseline
                     else if (current?.valid == true) current.value
                     else if (fallback?.status == SystemRuleStore.ReadStatus.MISSING) null else fallback?.encode()
-                val record = PendingJournalRecord(UUID.randomUUID().toString(), baseline, encoded, previous?.inFlight)
+                val record = nextPendingJournalRecord(UUID.randomUUID().toString(), previous, stagedRecord, baseline, encoded)
                 stagedRecord = record
+                // Remembering a baseline is not a receipt: the first durable stage still needs a readable Global.
                 if (previous == null && current?.valid != true) return@withLock false
                 writeJournal(record)
             }
@@ -232,12 +288,13 @@ internal object RuleSaveCoordinator {
         if ((result.verified || !result.uncertain) && acceptedDraft === next) acceptedDraft = null
         val elapsed = android.os.SystemClock.elapsedRealtime() - started
         ModuleDiagnostics.metric(ModuleDiagnostics.Metric.SAVE_MS, elapsed)
+        if (result.verified) ModuleDiagnostics.recover(ModuleDiagnostics.Code.SAVE_FAILED)
         ModuleDiagnostics.event(if (result.verified) ModuleDiagnostics.Code.SAVE_VERIFIED else ModuleDiagnostics.Code.SAVE_FAILED, id, elapsed)
         return result.verified
     }
 
     private fun preferences() = context.getSharedPreferences(SystemRuleStore.PREFERENCES_NAME, Context.MODE_PRIVATE)
-    private fun journalStore() = PendingJournalStore(object : PendingJournalStorage {
+    private fun journalStorage() = object : PendingJournalStorage {
         override fun readString(key: String): String? = preferences().getString(key, null)
         @SuppressLint("UseKtx") // KTX edit returns Unit; this path needs the actual commit receipt.
         override fun commit(values: Map<String, String?>): Boolean {
@@ -245,7 +302,8 @@ internal object RuleSaveCoordinator {
             values.forEach { (key, value) -> editor.putString(key, value) }
             return editor.commit()
         }
-    })
+    }
+    private fun journalStore() = PendingJournalStore(journalStorage())
     private fun readJournal(): PendingJournalRead {
         val result = journalStore().read()
         if (result === PendingJournalRead.Failed) ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED)
