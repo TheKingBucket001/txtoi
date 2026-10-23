@@ -468,6 +468,49 @@ class PublicationTest(unittest.TestCase):
         self.assertIsNone(self.main.record)
         self.assertIsNone(self.mirror.record)
 
+    def test_new_draft_visibility_delay_retries_lookup_without_recreating(self):
+        lookup = self.main.release
+        responses = iter((None, None, None))
+
+        def delayed(tag):
+            return next(responses, lookup(tag))
+
+        with patch.object(self.main, "release", side_effect=delayed), patch.object(publication.time, "sleep") as sleep:
+            self.publish()
+        self.assertEqual([(1,), (2,)], [call.args for call in sleep.call_args_list])
+        self.assertEqual(1, self.events.count((self.main.repository, "draft")))
+        self.assertFalse(self.main.record["draft"])
+        self.assertFalse(self.mirror.record["draft"])
+
+    def test_immediately_visible_drafts_and_public_rerun_do_not_wait(self):
+        with patch.object(publication.time, "sleep") as sleep:
+            self.publish()
+            self.events.clear()
+            self.publish()
+        sleep.assert_not_called()
+        self.assertFalse(any(action in ("draft", "upload", "publish") for _, action in self.events))
+
+    def test_new_draft_remaining_invisible_stops_after_bounded_lookup_retries(self):
+        with patch.object(self.main, "release", return_value=None), patch.object(publication.time, "sleep") as sleep:
+            with self.assertRaisesRegex(ValueError, "draft could not be confirmed"):
+                self.publish()
+        self.assertEqual([(1,), (2,), (4,), (8,)], [call.args for call in sleep.call_args_list])
+        self.assertEqual(1, self.events.count((self.main.repository, "draft")))
+        self.assertFalse(any(action in ("upload", "publish") for _, action in self.events))
+        self.assertIsNone(self.mirror.record)
+
+    def test_new_draft_lookup_api_failure_is_not_retried_or_recreated(self):
+        for message in ("HTTP 403", "network failure", "invalid release list"):
+            with self.subTest(error=message):
+                self.events.clear()
+                with patch.object(self.main, "release", side_effect=[None, None, ValueError(message), None]), patch.object(publication.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.publish()
+                self.assertEqual([(1,)], [call.args for call in sleep.call_args_list])
+                self.assertEqual(1, self.events.count((self.main.repository, "draft")))
+                self.assertFalse(any(action in ("upload", "publish") for _, action in self.events))
+                self.assertIsNone(self.mirror.record)
+
     def test_bad_asset_leaves_both_drafts_unpublished(self):
         self.mirror.asset_valid = False
         with self.assertRaisesRegex(ValueError, "digest"):

@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import quote
 
 
@@ -132,7 +133,14 @@ def publish_releases(repositories, commit, apk, expected_digest, notes):
             release = repository.release(tag)
             if release is None:
                 repository.create_draft(tag, title, notes)
-                release = repository.release(tag)
+                # A successful create can precede visibility in the release index.
+                # Retry only a missing lookup, never creation or an API failure.
+                for delay in (0, 1, 2, 4, 8):
+                    if delay:
+                        time.sleep(delay)
+                    release = repository.release(tag)
+                    if release is not None:
+                        break
             require(release is not None, f"{repository.repository}:{tag} draft could not be confirmed")
             if not release["draft"]:
                 # A rerun may resume after one repository was already published.
