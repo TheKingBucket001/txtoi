@@ -101,4 +101,26 @@ public class RuleBackupReceiptTest {
         assertEquals(1, storage.diskWrites);
         assertEquals(storage.memory, storage.disk);
     }
+
+    @Test public void aliasBackupNeedsADiskReceiptAndPreservesTheCompleteV4Record() {
+        SystemRuleStore.Snapshot snapshot = new SystemRuleStore.Snapshot(
+                java.util.Collections.singleton("p/p.Hidden"),
+                Arrays.asList("p/p.Second", "p/p.First"),
+                java.util.Collections.singletonMap("p/p.First", "搜索"));
+        String encoded = snapshot.encode();
+        assertTrue(encoded.startsWith("v4:"));
+        Storage storage = new Storage(false, false, true);
+
+        assertFalse(SystemRuleStore.persistBackup(storage.preferences, encoded));
+        assertEquals(OLD, storage.disk.get(SystemRuleStore.SETTING_KEY));
+        assertTrue(SystemRuleStore.persistBackup(storage.preferences, encoded));
+        SystemRuleStore.Snapshot restored = SystemRuleStore.decode(
+                (String) storage.disk.get(SystemRuleStore.SETTING_KEY));
+        assertTrue(restored.valid);
+        assertEquals(snapshot.hiddenComponents, restored.hiddenComponents);
+        assertEquals(snapshot.orderedComponents, restored.orderedComponents);
+        assertEquals(snapshot.aliases, restored.aliases);
+        assertEquals(3, storage.commits);
+        assertEquals(1, storage.diskWrites);
+    }
 }

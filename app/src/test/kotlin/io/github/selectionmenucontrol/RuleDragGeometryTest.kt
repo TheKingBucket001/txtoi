@@ -172,6 +172,35 @@ class RuleDragGeometryTest {
     }
 
     @Test
+    fun animatedRegrabsStayMonotonicAndBoundedAcrossDifferentHeightsAndSlots() {
+        val bounds = RuleDragBounds(-17f, 583f)
+        for (height in listOf(72f, 137f, 600f)) {
+            val firstTop = bounds.top
+            val lastTop = bounds.bottom - height
+            val middleTop = (firstTop + lastTop) / 2f
+            for (paintedPickup in listOf(firstTop, middleTop, lastTop)) {
+                for (logicalSlot in listOf(firstTop, middleTop, lastTop)) {
+                    val pointerTops = listOf(
+                        firstTop - 800f, firstTop, middleTop, lastTop, lastTop + 800f,
+                        paintedPickup - height, paintedPickup, paintedPickup + height,
+                    ).distinct().sorted()
+                    var previousCenter = Float.NEGATIVE_INFINITY
+                    for (pointerTop in pointerTops) {
+                        val context = "height=$height pickup=$paintedPickup slot=$logicalSlot pointer=$pointerTop"
+                        val center = RuleDragGeometry.insertionCenter(
+                            pointerTop, height, paintedPickup, logicalSlot, bounds,
+                        )!!
+                        assertTrue(context, center >= firstTop + height / 2f)
+                        assertTrue(context, center <= bounds.bottom - height / 2f)
+                        assertTrue(context, center >= previousCenter)
+                        previousCenter = center
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     fun anUnequalHeightMoveAcrossALockedSlotDoesNotOscillateAtTheCrossingPoint() {
         val before = listOf(
             RuleDragCell("a", 0, 0f, 72f), RuleDragCell("locked", 1, 72f, 200f),
@@ -236,5 +265,28 @@ class RuleDragGeometryTest {
         assertSame(entries, moveRuleSlots(entries, Entry::key, Entry::movable, "a", "unknown"))
         assertSame(entries, moveRuleSlots(entries, Entry::key, Entry::movable, "missing", "a"))
         assertSame(entries, moveRuleSlots(entries, Entry::key, Entry::movable, "b", "b"))
+    }
+
+    @Test
+    fun everyLockMaskPreservesLockedSlotsAndOtherMovableItemsRelativeOrder() {
+        val count = 6
+        for (mask in 0 until (1 shl count)) {
+            val original = List(count) { index -> Entry("row$index", mask and (1 shl index) != 0) }
+            val movable = original.filter(Entry::movable)
+            for (source in movable) {
+                for (target in movable) {
+                    val context = "mask=$mask from=${source.key} to=${target.key}"
+                    val moved = moveRuleSlots(original, Entry::key, Entry::movable, source.key, target.key)
+                    assertEquals(context, original.map(Entry::key).sorted(), moved.map(Entry::key).sorted())
+                    assertEquals(context, original.indexOf(target), moved.indexOf(source))
+                    original.indices.filter { !original[it].movable }.forEach { index ->
+                        assertSame(context, original[index], moved[index])
+                    }
+                    assertEquals(context,
+                        original.filter { it.movable && it.key != source.key }.map(Entry::key),
+                        moved.filter { it.movable && it.key != source.key }.map(Entry::key))
+                }
+            }
+        }
     }
 }

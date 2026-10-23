@@ -10,7 +10,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SystemHookProbeTest {
-    @Test fun missingResponsePublishesWithoutPollingAndStillOwnsCleanup() = runBlocking {
+    @Test fun missingResponseRetriesBrieflyAndStillOwnsCleanup() = runBlocking {
         val published = CompletableDeferred<SystemRuleStore.HookStatus>()
         val finishCleanup = CompletableDeferred<Unit>()
         var queries = 0
@@ -33,8 +33,8 @@ class SystemHookProbeTest {
             val status = published.await()
             assertEquals(ProbeProtocol.Status.NO_RESPONSE, status.status)
             assertFalse(status.loadedForCurrentBoot)
-            assertEquals(1, queries)
-            assertEquals(1, reads)
+            assertEquals(3, queries)
+            assertEquals(3, reads)
             assertTrue(task.isActive)
             assertFalse(cleaned)
         } finally {

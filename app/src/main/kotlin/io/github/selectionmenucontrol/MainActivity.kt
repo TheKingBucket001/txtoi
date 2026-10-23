@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.ActivityNotFoundException
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.util.Log
 import android.app.Application
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -32,6 +33,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -40,6 +43,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -82,6 +88,7 @@ import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.IconButton
+import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.preference.SwitchPreference
@@ -97,11 +104,18 @@ import kotlin.math.sin
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ModuleDiagnostics.configure { warning, summary ->
+            if (warning) Log.w("SelectionMenuControl", summary)
+            else Log.i("SelectionMenuControl", summary)
+        }
         enableEdgeToEdge()
         setContent {
             val controller = remember { ThemeController(ColorSchemeMode.MonetSystem, keyColor = Color(0xFF2879FF)) }
             MiuixTheme(controller = controller) {
-                ModuleApp(activity = this@MainActivity)
+                // Pages handle their own insets; the root host lets editors share this window.
+                Scaffold(modifier = Modifier.fillMaxSize(), contentWindowInsets = WindowInsets(0, 0, 0, 0)) { _ ->
+                    ModuleApp(activity = this@MainActivity)
+                }
             }
         }
     }
@@ -215,7 +229,9 @@ private fun ModuleApp(activity: MainActivity) {
                 return@Crossfade
             }
             Box(modifier = Modifier.fillMaxSize()
-                .background(MiuixTheme.colorScheme.background).safeDrawingPadding()) {
+                .background(MiuixTheme.colorScheme.background)
+                // Only the dialog contains an editor. Its IME must not shrink this page.
+                .windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout))) {
                 RuleScreen(activity, awaitEnvironmentCheck = environment::awaitCheckFinished) { showAbout = true }
             }
         }

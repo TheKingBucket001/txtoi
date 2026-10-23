@@ -39,12 +39,16 @@ internal class RuleSaveQueue<T>(
         )
     }
 
-    fun refresh(value: T, expected: RuleSaveState<T>?) {
+    fun refresh(value: T, expected: RuleSaveState<T>?): Boolean {
         // A load that started before another edit or write completion cannot replace it.
-        if (state.value === expected && !running && state.value?.verificationPending != true) initialize(value)
+        if (state.value !== expected || running || state.value?.verificationPending == true) return false
+        initialize(value)
+        return true
     }
-    fun resolve(value: T, expected: RuleSaveState<T>?) {
-        if (state.value === expected && !running) initialize(value)
+    fun resolve(value: T, expected: RuleSaveState<T>?): Boolean {
+        if (state.value !== expected || running) return false
+        initialize(value)
+        return true
     }
     fun markUnresolved(expected: RuleSaveState<T>?) {
         if (state.value === expected && !running) mutableState.value = expected?.copy(verificationPending = true)

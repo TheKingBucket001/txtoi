@@ -48,6 +48,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,7 +59,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -67,6 +67,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
@@ -80,6 +81,7 @@ import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.hideFromAccessibility
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -210,6 +212,10 @@ internal fun RuleScreen(
     var optionSize by remember { mutableStateOf(IntSize.Zero) }
     var coordinateState by remember { mutableStateOf<Pair<IntSize, Boolean>?>(null) }
     var restoreAction by rememberSaveable { mutableStateOf<RestoreAction?>(null) }
+    var aliasComponent by rememberSaveable { mutableStateOf<String?>(null) }
+    var aliasSessionId by rememberSaveable { mutableStateOf("") }
+    // A dismissed session survives only its exit animation, never Activity recreation.
+    var retainedAliasComponent by remember { mutableStateOf(aliasComponent) }
     var discardPrompt by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(saveState?.verificationPending) {
         if (saveState?.verificationPending != true) discardPrompt = false
@@ -275,6 +281,7 @@ internal fun RuleScreen(
         return !editor.checking.value && !latest.verificationPending && latest.value.valid
             && latest.value.hiddenComponents == start.hiddenComponents
             && latest.value.orderedComponents == start.orderedComponents
+            && latest.value.aliases == start.aliases
     }
 
     val refreshPackages by rememberUpdatedState { loadSignal++ }
@@ -361,7 +368,7 @@ internal fun RuleScreen(
     // Saved-state replay and external refresh can update the editor after the page has loaded.
     // Preview moves change displayedProcessors only, so they never trigger this effect.
     LaunchedEffect(originalProcessors, saveState?.value?.orderedComponents,
-        saveState?.value?.hiddenComponents, initializing, initializationError) {
+        saveState?.value?.hiddenComponents, saveState?.value?.aliases, initializing, initializationError) {
         if (!initializing && initializationError == null) synchronizePresentation()
     }
 
@@ -393,7 +400,8 @@ internal fun RuleScreen(
         }
     }
 
-    fun createAndSave(hidden: Set<String>, order: List<String>): Boolean {
+    fun createAndSave(hidden: Set<String>, order: List<String>,
+        aliases: Map<String, String> = editor.state.value?.value?.aliases ?: emptyMap()): Boolean {
         releasedDrag = null
         if (initializing || editor.checking.value || initializationError != null || editor.state.value?.value?.valid != true
             || editor.state.value?.verificationPending == true || dragSession != null) {
@@ -401,7 +409,7 @@ internal fun RuleScreen(
             return false
         }
         return try {
-            val next = SystemRuleStore.Snapshot(hidden, order)
+            val next = SystemRuleStore.Snapshot(hidden, order, aliases)
             next.encode() // Validate the encoded size before changing presentation or submitting IO.
             displayedProcessors = applyOrder(originalProcessors, next.orderedComponents)
             editor.save(next)
@@ -428,6 +436,18 @@ internal fun RuleScreen(
         val hidden = current.hiddenComponents.toMutableSet()
         if (!hidden.add(component)) hidden.remove(component)
         createAndSave(hidden, current.orderedComponents)
+    }
+
+    fun editAlias(processor: Processor): Boolean {
+        if (!canUseActions || restoreAction != null || retainedAliasComponent != null) return false
+        val current = editor.state.value?.value?.takeIf { it.valid } ?: return false
+        if (processor.component in current.hiddenComponents) return false
+        releasedDrag = null
+        // The page can leave composition (for example, About), so a counter may repeat.
+        aliasSessionId = java.util.UUID.randomUUID().toString()
+        aliasComponent = processor.component
+        retainedAliasComponent = processor.component
+        return true
     }
 
     fun moveOne(component: String, direction: Int): Boolean {
@@ -459,7 +479,7 @@ internal fun RuleScreen(
 
     val dragCallbacks by rememberUpdatedState(RuleDragCallbacks(
         start = start@{ position ->
-            if (!canChange || restoreAction != null || dragSession != null || position.x !in gripStart..gripEnd) return@start false
+            if (!canChange || restoreAction != null || retainedAliasComponent != null || dragSession != null || position.x !in gripStart..gripEnd) return@start false
             val layout = listState.layoutInfo
             val released = releasedDrag
             val releasedCell = released?.let {
@@ -607,7 +627,7 @@ internal fun RuleScreen(
                             colorFilter = ColorFilter.tint(MiuixTheme.colorScheme.onBackground))
                     }
                 }
-                Text("勾选隐藏 · 拖动排序 · 自动保存", modifier = Modifier.padding(top = 4.dp),
+                Text("勾选隐藏 · 拖动排序 · 点铅笔改名", modifier = Modifier.padding(top = 4.dp),
                     fontSize = 13.sp, color = MiuixTheme.colorScheme.onBackgroundVariant)
                 if (saveState?.verificationPending == true) {
                     TextButton(text = "保存结果待核对 · 重新核对", onClick = { loadSignal++ }, enabled = !initializing && !recoveryChecking,
@@ -684,6 +704,7 @@ internal fun RuleScreen(
                     LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                         items(displayedProcessors, key = { it.component }) { processor ->
                             val hidden = processor.component in snapshot.hiddenComponents
+                            val alias = snapshot.aliases[processor.component]
                             val lockedReason = when {
                                 processor.fixed -> "位置由系统固定，不能移动"
                                 !processor.classificationKnown -> "排序检测不可用"
@@ -691,13 +712,16 @@ internal fun RuleScreen(
                                 else -> null
                             }
                             val index = movement.positions[processor.component] ?: -1
-                            val actions = if (canUseActions && movable(processor)) buildList {
-                                if (index > 0) add(CustomAccessibilityAction("上移") { moveOne(processor.component, -1) })
-                                if (index >= 0 && index < movement.components.lastIndex) add(CustomAccessibilityAction("下移") { moveOne(processor.component, 1) })
+                            val actions = if (canUseActions) buildList {
+                                if (!hidden) add(CustomAccessibilityAction("修改菜单名称") { editAlias(processor) })
+                                if (movable(processor)) {
+                                    if (index > 0) add(CustomAccessibilityAction("上移") { moveOne(processor.component, -1) })
+                                    if (index >= 0 && index < movement.components.lastIndex) add(CustomAccessibilityAction("下移") { moveOne(processor.component, 1) })
+                                }
                             } else emptyList()
                             val isPlaceholder = dragSession?.component == processor.component
                             val released = releasedDrag?.takeIf { it.component == processor.component }
-                            val placement = if (isPlaceholder) Modifier.alpha(0f).clearAndSetSemantics { }
+                            val placement = if (isPlaceholder) Modifier
                             else if (released != null) Modifier.zIndex(1f).offset {
                                 val slotTop = listState.layoutInfo.visibleItemsInfo
                                     .firstOrNull { it.key == released.component }?.offset ?: released.top.value.roundToInt()
@@ -707,14 +731,22 @@ internal fun RuleScreen(
                             else Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null,
                                 placementSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = RuleReorderStiffness))
                             ProcessorRuleRow(
-                                processor = processor, hidden = hidden, enabled = canChange,
+                                processor = processor, hidden = hidden, enabled = canChange && !isPlaceholder,
+                                alias = alias, onEditAlias = { editAlias(processor) }, aliasEnabled = canUseActions && !hidden,
                                 handleEnabled = canChange && lockedReason == null, lockedReason = lockedReason,
-                                accessibilityActions = actions, interactive = !isPlaceholder,
+                                accessibilityActions = actions,
                                 viewportHeight = optionSize.height,
                                 onMoveUp = if (canUseActions && index > 0) ({ if (moveOne(processor.component, -1)) Unit else Unit }) else null,
                                 onMoveDown = if (canUseActions && index >= 0 && index < movement.components.lastIndex)
                                     ({ if (moveOne(processor.component, 1)) Unit else Unit }) else null,
-                                modifier = placement.onGloballyPositioned { visualPositions.rows[processor.component] = it },
+                                // Retain the row's semantics node across pickup and cancellation.
+                                // Clearing and then recreating its descendants can leave the lazy
+                                // item's restored row missing from Android's accessibility tree.
+                                modifier = placement.graphicsLayer {
+                                    alpha = if (isPlaceholder) 0f else 1f
+                                }.semantics {
+                                    if (isPlaceholder) hideFromAccessibility()
+                                }.onGloballyPositioned { visualPositions.rows[processor.component] = it },
                                 onCheckedChange = { changeHidden(processor.component) },
                             )
                         }
@@ -726,6 +758,7 @@ internal fun RuleScreen(
                         if (processor != null && top != null) {
                             ProcessorRuleRow(
                                 processor = processor, hidden = processor.component in snapshot.hiddenComponents,
+                                alias = snapshot.aliases[processor.component],
                                 enabled = true, handleEnabled = true, interactive = false, isDragging = true,
                                 modifier = Modifier.fillMaxWidth()
                                     .offset { IntOffset(0, overlayPixelTop(top, active.height,
@@ -754,8 +787,8 @@ internal fun RuleScreen(
             Column(modifier = Modifier.dialogContent(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (restoringOrder) "恢复默认排序" else "恢复全部显示", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Text(
-                    if (restoringOrder) "将清除扩展项的自定义排序，隐藏设置保持不变。"
-                    else "将清除隐藏规则，当前排序保持不变。",
+                    if (restoringOrder) "将清除扩展项的自定义排序，隐藏和名称设置保持不变。"
+                    else "将清除隐藏规则，当前排序和名称设置保持不变。",
                     fontSize = 14.sp, lineHeight = 20.sp,
                 )
                 DialogActions("取消", { restoreAction = null }, "确认恢复", {
@@ -767,6 +800,24 @@ internal fun RuleScreen(
                 }, confirmEnabled = canUseActions)
             }
         })
+    }
+    retainedAliasComponent?.let { component ->
+        val processor = originalProcessors.firstOrNull { it.component == component }
+        // A new edit must not consume restored draft state from an earlier dialog session.
+        key(component, aliasSessionId) {
+            MenuAliasDialog(component = component, show = aliasComponent != null, originalLabel = processor?.label,
+                savedAlias = snapshot.aliases[component].orEmpty(), enabled = canUseActions,
+                onDismiss = { aliasComponent = null }, onDismissFinished = { retainedAliasComponent = null },
+                onSave = save@{ name, baseline ->
+                    if (aliasComponent != component || !canUseActions) return@save false
+                    val current = editor.state.value?.value?.takeIf { it.valid } ?: return@save false
+                    if (current.aliases[component].orEmpty() != baseline) return@save false
+                    val aliases = current.aliases.toMutableMap().apply {
+                        if (name.isEmpty()) remove(component) else put(component, name)
+                    }
+                    aliases == current.aliases || createAndSave(current.hiddenComponents, current.orderedComponents, aliases)
+                })
+        }
     }
     if (discardPrompt && saveState?.verificationPending == true) {
         WindowDialog(show = true, onDismissRequest = { discardPrompt = false }, content = {
@@ -839,6 +890,9 @@ private fun ProcessorRuleRow(
     viewportHeight: Int = 0,
     onMoveUp: (() -> Unit)? = null,
     onMoveDown: (() -> Unit)? = null,
+    alias: String? = null,
+    onEditAlias: (() -> Unit)? = null,
+    aliasEnabled: Boolean = false,
 ) {
     val interactions = remember(processor.component) { MutableInteractionSource() }
     val pressed by interactions.collectIsPressedAsState()
@@ -872,12 +926,19 @@ private fun ProcessorRuleRow(
                 if (lockedReason == null) DragGrip(handleColor) else LockGrip(handleColor)
             }
             Column(modifier = Modifier.weight(1f).padding(vertical = 10.dp)) {
-                Text(processor.label, fontSize = 16.sp, fontWeight = FontWeight.Medium,
+                Text(alias ?: processor.label, fontSize = 16.sp, fontWeight = FontWeight.Medium,
                     maxLines = 2, overflow = TextOverflow.Ellipsis,
                     color = MiuixTheme.colorScheme.onSurfaceContainer.copy(alpha = if (enabled) 1f else 0.45f))
-                Text(processor.summary, modifier = Modifier.padding(top = 2.dp), fontSize = 10.sp,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                Text(if (alias == null) processor.summary else "原名：${processor.label}\n${processor.summary}",
+                    modifier = Modifier.padding(top = 2.dp), fontSize = 10.sp,
+                    maxLines = if (alias == null) 1 else 2, overflow = TextOverflow.Ellipsis,
                     color = MiuixTheme.colorScheme.onSurfaceContainerVariant.copy(alpha = if (enabled) 1f else 0.45f))
+            }
+            IconButton(onClick = { onEditAlias?.invoke() }, enabled = aliasEnabled,
+                modifier = Modifier.size(48.dp).then(if (interactive) Modifier else Modifier.clearAndSetSemantics { })) {
+                Image(painterResource(R.drawable.ic_edit), contentDescription = "修改「${alias ?: processor.label}」的菜单名称",
+                    modifier = Modifier.size(19.dp), colorFilter = ColorFilter.tint(
+                        MiuixTheme.colorScheme.onSurfaceContainerVariant.copy(alpha = if (aliasEnabled) 0.8f else 0.35f)))
             }
             Box(modifier = Modifier.padding(start = 10.dp, end = 16.dp)) { RuleCheck(hidden, enabled) }
         }

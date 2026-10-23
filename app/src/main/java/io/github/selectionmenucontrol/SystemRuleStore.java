@@ -6,8 +6,10 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
 
 /** Global is authoritative; private data is only a checked backup or a pending transaction. */
 final class SystemRuleStore {
@@ -30,7 +32,7 @@ final class SystemRuleStore {
     }
     static Snapshot readGlobal(Context context) {
         try {
-            Snapshot value = decode(Settings.Global.getString(context.getContentResolver(), SETTING_KEY));
+            Snapshot value = decodeGlobal(Settings.Global.getString(context.getContentResolver(), SETTING_KEY));
             ModuleDiagnostics.recover(ModuleDiagnostics.Code.RULES_READ_FAILED);
             if (value.valid) ModuleDiagnostics.recover(ModuleDiagnostics.Code.RULES_INVALID);
             return value;
@@ -48,7 +50,9 @@ final class SystemRuleStore {
         try {
             android.content.SharedPreferences preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE);
             // Once Global has existed, its deliberate deletion must not resurrect a private old copy.
-            return preferences.getBoolean("global_established", false) ? global : decode(preferences.getString(SETTING_KEY, null));
+            if (preferences.getBoolean("global_established", false)) return global;
+            String backup = preferences.getString(SETTING_KEY, null);
+            return backup == null ? global : decode(backup);
         } catch (Exception error) {
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.BACKUP_FAILED);
             return Snapshot.unavailable(ReadStatus.UNREADABLE);
@@ -132,24 +136,32 @@ final class SystemRuleStore {
         try { return Settings.Global.getInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, -1); }
         catch (Exception ignored) { return -1; }
     }
-    static synchronized SaveResult saveDetailed(Context context, Snapshot snapshot, boolean conditional, String expected) {
-        if (!snapshot.valid) return new SaveResult(false, false, false);
+    static synchronized SaveResult saveDetailed(Context context, Snapshot snapshot, String expected) {
+        return saveDetailed(snapshot, expected,
+                (encoded, baseline) -> RootAccess.putGlobalSettingVerifiedResult(SETTING_KEY, encoded, baseline),
+                () -> repairBackup(context));
+    }
+    interface VerifiedRuleWriter {
+        RootAccess.ExecutionResult write(String encoded, String expected);
+    }
+    /** The writer always compares the exact observed baseline, including a missing (null) value. */
+    static SaveResult saveDetailed(Snapshot snapshot, String expected, VerifiedRuleWriter writer,
+                                   BooleanSupplier repairBackup) {
+        if (!snapshot.valid) return new SaveResult(false, false, false, RootAccess.Failure.INVALID_INPUT);
         final String encoded;
         try { encoded = snapshot.encode(); }
         catch (IllegalArgumentException error) {
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.RULES_LIMIT_EXCEEDED);
-            return new SaveResult(false, false, false);
+            return new SaveResult(false, false, false, RootAccess.Failure.INVALID_INPUT);
         }
-        RootAccess.ExecutionResult result = conditional
-                ? RootAccess.putGlobalSettingVerifiedResult(SETTING_KEY, encoded, expected)
-                : RootAccess.putGlobalSettingVerifiedResult(SETTING_KEY, encoded);
+        RootAccess.ExecutionResult result = writer.write(encoded, expected);
         ModuleDiagnostics.metric(ModuleDiagnostics.Metric.ROOT_MS, result.elapsedMillis);
         if (!result.success) {
             ModuleDiagnostics.fault(rootFailureCode(result.failure));
-            return new SaveResult(false, false, result.uncertainWrite || result.failure == RootAccess.Failure.LOCK_BUSY);
+            return new SaveResult(false, false, result.uncertainWrite, result.failure);
         }
         recoverRootFailures();
-        return new SaveResult(true, repairBackup(context), false);
+        return new SaveResult(true, repairBackup.getAsBoolean(), false, RootAccess.Failure.NONE);
     }
     private static void recoverRootFailures() {
         for (RootAccess.Failure failure : RootAccess.Failure.values()) ModuleDiagnostics.recover(rootFailureCode(failure));
@@ -176,9 +188,10 @@ final class SystemRuleStore {
             // Re-read while sharing the writer lock. A page read captured before a save is not a backup source.
             RawValue current = readRawGlobal(context);
             if (!current.valid || current.value == null) return false;
-            String encoded = decode(current.value).encode();
             android.content.SharedPreferences preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE);
-            if (persistBackup(preferences, encoded)) {
+            // Global is authoritative. Preserve its exact valid record, including
+            // externally supplied ordering, so the backup can be compared byte-for-byte.
+            if (persistBackup(preferences, current.value)) {
                 ModuleDiagnostics.recover(ModuleDiagnostics.Code.BACKUP_FAILED);
                 return true;
             }
@@ -213,7 +226,7 @@ final class SystemRuleStore {
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED);
             return false;
         }
-        return snapshot.valid && saveDetailed(context, snapshot, true, null).verified;
+        return snapshot.valid && saveDetailed(context, snapshot, null).verified;
     }
     static String respondToProbe(Context context, String lastRespondedNonce) {
         long identity = Binder.clearCallingIdentity();
@@ -235,10 +248,18 @@ final class SystemRuleStore {
         return null;
     }
     static Snapshot decode(String value) {
+        return decode(value, false);
+    }
+    /** Only an authoritative Global read grants a raw observation; drafts and backups have none. */
+    static Snapshot decodeGlobal(String value) {
+        return decode(value, true);
+    }
+    private static Snapshot decode(String value, boolean authoritative) {
         try {
             RuleConfig decoded = RuleConfig.decode(value);
-            return new Snapshot(decoded.hiddenComponents, decoded.orderedComponents,
-                    value == null ? ReadStatus.MISSING : ReadStatus.VALID);
+            return new Snapshot(decoded.hiddenComponents, decoded.orderedComponents, decoded.aliases,
+                    value == null ? ReadStatus.MISSING : ReadStatus.VALID,
+                    authoritative ? new RawValue(value, true) : null);
         } catch (IllegalArgumentException error) {
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.RULES_INVALID);
             return Snapshot.unavailable(ReadStatus.MALFORMED);
@@ -263,21 +284,37 @@ final class SystemRuleStore {
     }
     static final class SaveResult {
         final boolean verified, backupCurrent, uncertain;
-        SaveResult(boolean verified, boolean backupCurrent, boolean uncertain) {
+        final RootAccess.Failure failure;
+        SaveResult(boolean verified, boolean backupCurrent, boolean uncertain, RootAccess.Failure failure) {
             this.verified = verified; this.backupCurrent = backupCurrent; this.uncertain = uncertain;
+            this.failure = failure;
+        }
+        boolean requiresReconciliation() {
+            return uncertain || failure == RootAccess.Failure.LOCK_BUSY || failure == RootAccess.Failure.STALE_REVISION;
         }
     }
     static final class Snapshot extends RuleConfig {
         final boolean valid;
         final ReadStatus status;
+        final RawValue sourceGlobal;
         Snapshot(Set<String> hidden) { this(hidden, Collections.emptyList()); }
-        Snapshot(Set<String> hidden, List<String> order) { this(hidden, order, ReadStatus.VALID); }
-        private Snapshot(Set<String> hidden, List<String> order, ReadStatus status) {
-            super(hidden, order); this.status = status;
+        Snapshot(Set<String> hidden, List<String> order) { this(hidden, order, Collections.emptyMap()); }
+        Snapshot(Set<String> hidden, List<String> order, Map<String, String> aliases) {
+            this(hidden, order, aliases, ReadStatus.VALID);
+        }
+        private Snapshot(Set<String> hidden, List<String> order, Map<String, String> aliases, ReadStatus status) {
+            this(hidden, order, aliases, status, null);
+        }
+        private Snapshot(Set<String> hidden, List<String> order, Map<String, String> aliases, ReadStatus status,
+                         RawValue sourceGlobal) {
+            super(hidden, order, aliases); this.status = status;
             valid = status == ReadStatus.VALID || status == ReadStatus.MISSING;
+            this.sourceGlobal = sourceGlobal;
         }
         static Snapshot empty() { return new Snapshot(Collections.emptySet()); }
-        static Snapshot unavailable(ReadStatus status) { return new Snapshot(Collections.emptySet(), Collections.emptyList(), status); }
+        static Snapshot unavailable(ReadStatus status) {
+            return new Snapshot(Collections.emptySet(), Collections.emptyList(), Collections.emptyMap(), status);
+        }
     }
     static final class HookStatus {
         final boolean loadedForCurrentBoot;

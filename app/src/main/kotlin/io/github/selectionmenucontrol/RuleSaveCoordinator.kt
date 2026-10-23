@@ -24,9 +24,8 @@ internal object RuleSaveCoordinator {
     private var stage: Deferred<Boolean>? = null
     private val recoveryChecking = MutableStateFlow(false)
     val checking = recoveryChecking.asStateFlow()
-    private var lastUncertain = false
-    private var recoveryTarget: SystemRuleStore.Snapshot? = null
-    private var recoveryBaseline: String? = null
+    private var requiresReconciliation = false
+    @Volatile private var confirmedGlobal: SystemRuleStore.RawValue? = null
     private var acceptedDraft: SystemRuleStore.Snapshot? = null
     @Volatile private var stagedRecord: PendingJournalRecord? = null
     private var pendingCleanup: PendingJournalRecord? = null
@@ -38,7 +37,7 @@ internal object RuleSaveCoordinator {
         read = { withContext(Dispatchers.IO) { SystemRuleStore.readGlobal(context) } },
         onError = { ModuleDiagnostics.fault(ModuleDiagnostics.Code.SAVE_FAILED) },
         isAuthoritative = { it.valid },
-        keepDraftOnFailure = { lastUncertain },
+        keepDraftOnFailure = { requiresReconciliation },
     )
     val state = queue.state
 
@@ -46,7 +45,7 @@ internal object RuleSaveCoordinator {
         context = appContext.applicationContext as Application
         if (discardRequested) { discardUnsaved(); return }
         if (recoveryChecking.value) return
-        queue.refresh(snapshot, expected)
+        if (queue.refresh(snapshot, expected)) confirmedGlobal = snapshot.sourceGlobal
         if (state.value?.pending == true) return
         recoveryChecking.value = true
         val observedState = state.value
@@ -106,14 +105,14 @@ internal object RuleSaveCoordinator {
                     ModuleDiagnostics.recover(ModuleDiagnostics.Code.JOURNAL_FAILED)
                     stagedRecord = null
                     acceptedDraft = null
-                    if (state.value === observedState) queue.resolve(SystemRuleStore.decode(current.value), observedState)
+                    resolveCurrent(current.value, observedState)
                     withContext(Dispatchers.IO) { SystemRuleStore.repairBackup(context) }
                     return@launch
                 }
                 if (record == null) {
                     // This process has accepted no edit. A previous read fault must not
                     // turn an old page snapshot into a new write after the record disappears.
-                    if (state.value === observedState) queue.resolve(SystemRuleStore.decode(current.value), observedState)
+                    resolveCurrent(current.value, observedState)
                     return@launch
                 }
                 if (observedDraft != null) {
@@ -135,22 +134,31 @@ internal object RuleSaveCoordinator {
                     PendingRuleRecovery.Action.COMPLETE -> {
                         val cleared = journalMutex.withLock { withContext(Dispatchers.IO) { clearJournal(recovered.id) } }
                         if (!cleared) { pendingCleanup = recovered; queue.markUnresolved(observedState); return@launch }
-                        val actual = SystemRuleStore.decode(current.value)
-                        if (state.value === observedState) { acceptedDraft = null; queue.resolve(actual, observedState) }
+                        if (state.value === observedState) { acceptedDraft = null; resolveCurrent(current.value, observedState) }
                         withContext(Dispatchers.IO) { SystemRuleStore.repairBackup(context) }
                     }
                     PendingRuleRecovery.Action.CONFLICT -> {
                         val cleared = journalMutex.withLock { withContext(Dispatchers.IO) { clearJournal(recovered.id) } }
                         if (!cleared) { pendingCleanup = recovered; queue.markUnresolved(observedState); return@launch }
                         ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_CONFLICT)
-                        if (state.value === observedState) { acceptedDraft = null; queue.resolve(SystemRuleStore.decode(current.value), observedState) }
+                        if (state.value === observedState) { acceptedDraft = null; resolveCurrent(current.value, observedState) }
+                        // The external value is authoritative. Keep the private backup aligned
+                        // with that value before declaring reconciliation complete.
+                        withContext(Dispatchers.IO) { SystemRuleStore.repairBackup(context) }
                     }
                     PendingRuleRecovery.Action.REPLAY -> {
                         val target = SystemRuleStore.decode(recovered.target)
                         if (target.valid && state.value === observedState) {
+                            // A fenced, known in-flight value is now our acknowledged baseline.
+                            // Persist that rebase before preparing the next conditional writer.
+                            val rebased = recovered.copy(baseline = current.value, inFlight = null)
+                            val written = journalMutex.withLock { withContext(Dispatchers.IO) { writeJournal(rebased) } }
+                            if (!written || state.value !== observedState) {
+                                queue.markUnresolved(observedState)
+                                return@launch
+                            }
+                            confirmedGlobal = current
                             acceptedDraft = target
-                            recoveryTarget = target
-                            recoveryBaseline = current.value
                             stage = null
                             queue.submit(target)
                         }
@@ -203,11 +211,9 @@ internal object RuleSaveCoordinator {
                 acceptedDraft = null
                 stagedRecord = null
                 pendingCleanup = null
-                recoveryTarget = null
-                recoveryBaseline = null
                 stage = null
-                lastUncertain = false
-                queue.resolve(SystemRuleStore.decode(result.current), observedState)
+                requiresReconciliation = false
+                resolveCurrent(result.current, observedState)
                 ModuleDiagnostics.recover(ModuleDiagnostics.Code.JOURNAL_FAILED)
                 withContext(Dispatchers.IO) { SystemRuleStore.repairBackup(context) }
             } catch (error: Exception) {
@@ -224,7 +230,8 @@ internal object RuleSaveCoordinator {
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.RULES_LIMIT_EXCEEDED)
             return
         }
-        val previousSnapshot = state.value?.value
+        // A definite-failure readback may have been adopted by the FIFO since the last save.
+        state.value?.value?.sourceGlobal?.let { confirmedGlobal = it }
         acceptedDraft = snapshot
         // Stage the latest draft independently of a slow Root call. Never do disk IO on the UI thread.
         stage = staging.submit {
@@ -233,11 +240,10 @@ internal object RuleSaveCoordinator {
                 if (read === PendingJournalRead.Failed) return@withLock false
                 val previous = (read as? PendingJournalRead.Found)?.record
                 val current = if (previous == null) SystemRuleStore.readRawGlobal(context) else null
-                val fallback = previousSnapshot?.takeIf { it.valid }
-                if (previous == null && current?.valid != true && fallback == null) return@withLock false
-                val baseline = if (previous != null) previous.baseline
-                    else if (current?.valid == true) current.value
-                    else if (fallback?.status == SystemRuleStore.ReadStatus.MISSING) null else fallback?.encode()
+                val observed = confirmedGlobal
+                if (previous == null && stagedRecord == null && observed?.valid != true) return@withLock false
+                // Never rebase a stale page draft onto an external value read at submission time.
+                val baseline = if (previous != null) previous.baseline else observed?.value
                 val record = nextPendingJournalRecord(UUID.randomUUID().toString(), previous, stagedRecord, baseline, encoded)
                 stagedRecord = record
                 // Remembering a baseline is not a receipt: the first durable stage still needs a readable Global.
@@ -253,44 +259,49 @@ internal object RuleSaveCoordinator {
         val started = android.os.SystemClock.elapsedRealtime()
         ModuleDiagnostics.event(ModuleDiagnostics.Code.SAVE_STARTED, id, 0)
         val staged = stage?.await() ?: true
-        lastUncertain = false
-        if (!staged) { lastUncertain = true; ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED); return false }
+        requiresReconciliation = false
+        if (!staged) { requiresReconciliation = true; ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED); return false }
         val prepared = journalMutex.withLock {
             withContext(Dispatchers.IO) {
-                val record = (readJournal() as? PendingJournalRead.Found)?.record ?: return@withContext false
-                writeJournal(record.copy(inFlight = next.encode()))
+                val record = (readJournal() as? PendingJournalRead.Found)?.record ?: return@withContext null
+                val prepared = record.copy(inFlight = next.encode())
+                if (writeJournal(prepared)) prepared else null
             }
         }
-        if (!prepared) { lastUncertain = true; ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED); return false }
-        val conditional = recoveryTarget === next
-        val expected = recoveryBaseline
-        if (conditional) { recoveryTarget = null; recoveryBaseline = null }
+        if (prepared == null) { requiresReconciliation = true; ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED); return false }
         // An unexpected exception after launch does not prove that the remote write stopped.
-        lastUncertain = true
-        val result = withContext(Dispatchers.IO) { SystemRuleStore.saveDetailed(context, next, conditional, expected) }
+        requiresReconciliation = true
+        val result = withContext(Dispatchers.IO) { SystemRuleStore.saveDetailed(context, next, prepared.baseline) }
         if (result.verified && !result.backupCurrent) ModuleDiagnostics.event(ModuleDiagnostics.Code.BACKUP_FAILED, id, 0)
-        lastUncertain = result.uncertain
+        requiresReconciliation = result.requiresReconciliation()
         val encoded = next.encode()
         val settled = journalMutex.withLock {
             // Read edit identity on the UI dispatcher while staging is excluded by this lock.
             // An edit accepted during the following IO will stage after this settlement.
             val latestAcceptedEdit = acceptedDraft === next
-            withContext(Dispatchers.IO) {
+            val saved = withContext(Dispatchers.IO) {
                 settlePendingRuleWrite(readJournal(), encoded, latestAcceptedEdit,
-                    result.verified, result.uncertain, ::writeJournal, ::clearJournal)
+                    result.verified, requiresReconciliation, ::writeJournal, ::clearJournal)
             }
+            if (saved && result.verified) confirmedGlobal = SystemRuleStore.RawValue(encoded, true)
+            saved
         }
         if (!settled) {
-            lastUncertain = true
+            requiresReconciliation = true
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.JOURNAL_FAILED)
             return false
         }
-        if ((result.verified || !result.uncertain) && acceptedDraft === next) acceptedDraft = null
+        if ((result.verified || !requiresReconciliation) && acceptedDraft === next) acceptedDraft = null
         val elapsed = android.os.SystemClock.elapsedRealtime() - started
         ModuleDiagnostics.metric(ModuleDiagnostics.Metric.SAVE_MS, elapsed)
         if (result.verified) ModuleDiagnostics.recover(ModuleDiagnostics.Code.SAVE_FAILED)
         ModuleDiagnostics.event(if (result.verified) ModuleDiagnostics.Code.SAVE_VERIFIED else ModuleDiagnostics.Code.SAVE_FAILED, id, elapsed)
         return result.verified
+    }
+
+    private fun resolveCurrent(raw: String?, expected: RuleSaveState<SystemRuleStore.Snapshot>?) {
+        val actual = SystemRuleStore.decodeGlobal(raw)
+        if (queue.resolve(actual, expected)) confirmedGlobal = actual.sourceGlobal
     }
 
     private fun preferences() = context.getSharedPreferences(SystemRuleStore.PREFERENCES_NAME, Context.MODE_PRIVATE)

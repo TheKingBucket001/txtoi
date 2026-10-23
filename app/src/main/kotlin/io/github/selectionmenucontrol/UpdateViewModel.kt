@@ -2,8 +2,6 @@ package io.github.selectionmenucontrol
 
 import android.app.Application
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -38,7 +36,7 @@ internal object UpdateSettings {
 /** Owns one request across rotation. Backgrounding or disabling automatic checks cancels its IO. */
 internal class UpdateViewModel(application: Application) : AndroidViewModel(application) {
     private val controller = UpdateCheckController(viewModelScope) { manual ->
-        UpdateRepository.check(getApplication(), manual)
+        UpdateRepository.check(manual)
     }
     val state = controller.state
 
@@ -62,30 +60,28 @@ private object UpdateRepository {
     private var lastResult: UpdateCheckResult? = null
     private var completedAt = -1L
 
-    suspend fun check(context: Context, manual: Boolean): UpdateCheckResult = mutex.withLock {
+    suspend fun check(manual: Boolean): UpdateCheckResult = mutex.withLock {
         val now = SystemClock.elapsedRealtime()
         val previous = lastResult
         val validity = if (previous == UpdateCheckResult.Failed) FAILURE_VALIDITY_MS else CACHE_VALIDITY_MS
         if (!manual && previous != null && UpdatePolicy.fresh(completedAt, now, validity)) return@withLock previous
         val deadline = now + TOTAL_TIMEOUT_MS
         val result = try {
-            if (!waitForNetwork(context, deadline)) UpdateCheckResult.Failed else {
-                var release: UpdateInfo? = null
-                repeat(2) { attempt ->
-                    if (release != null) return@repeat
+            var release: UpdateInfo? = null
+            repeat(2) { attempt ->
+                if (release != null) return@repeat
+                currentCoroutineContext().ensureActive()
+                try { release = requestLatestRelease(deadline) }
+                catch (error: Exception) {
                     currentCoroutineContext().ensureActive()
-                    try { release = requestLatestRelease(deadline) }
-                    catch (error: Exception) {
-                        currentCoroutineContext().ensureActive()
-                        if (error is CancellationException && error !is TimeoutCancellationException) throw error
-                        if (attempt == 0 && SystemClock.elapsedRealtime() + 1_000 < deadline) delay(1_000)
-                    }
+                    if (error is CancellationException && error !is TimeoutCancellationException) throw error
+                    if (attempt == 0 && SystemClock.elapsedRealtime() + 1_000 < deadline) delay(1_000)
                 }
-                release?.let {
-                    if (UpdatePolicy.isVersionNewer(it.version, BuildConfig.VERSION_NAME)) UpdateCheckResult.Available(it)
-                    else UpdateCheckResult.UpToDate
-                } ?: UpdateCheckResult.Failed
             }
+            release?.let {
+                if (UpdatePolicy.isVersionNewer(it.version, BuildConfig.VERSION_NAME)) UpdateCheckResult.Available(it)
+                else UpdateCheckResult.UpToDate
+            } ?: UpdateCheckResult.Failed
         } catch (error: Exception) {
             if (error is CancellationException) throw error
             UpdateCheckResult.Failed
@@ -95,19 +91,6 @@ private object UpdateRepository {
         if (result == UpdateCheckResult.Failed) ModuleDiagnostics.fault(ModuleDiagnostics.Code.UPDATE_FAILED)
         else ModuleDiagnostics.recover(ModuleDiagnostics.Code.UPDATE_FAILED)
         result
-    }
-
-    private suspend fun waitForNetwork(context: Context, deadline: Long): Boolean {
-        val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
-        val networkDeadline = minOf(deadline, SystemClock.elapsedRealtime() + 5_000L)
-        do {
-            currentCoroutineContext().ensureActive()
-            val capabilities = connectivity.activeNetwork?.let(connectivity::getNetworkCapabilities)
-            if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return true
-            delay(250)
-        } while (SystemClock.elapsedRealtime() < networkDeadline)
-        return false
     }
 
     /** Disconnect on cancellation; no response body is downloaded. Every redirect stays in our repository. */

@@ -97,7 +97,8 @@ public final class SelectionMenuModule extends XposedModule {
         try {
             boolean originalQuery = isOriginalQuery(intent);
             SystemRuleStore.Snapshot rules = readRules();
-            if (!originalQuery && (!rules.valid || (rules.hiddenComponents.isEmpty() && rules.orderedComponents.isEmpty()))) {
+            if (!originalQuery && (!rules.valid || (rules.hiddenComponents.isEmpty()
+                    && rules.orderedComponents.isEmpty() && rules.aliases.isEmpty()))) {
                 respondToProbe(false);
                 ModuleDiagnostics.recover(ModuleDiagnostics.Code.QUERY_FAILED);
                 return result;
@@ -153,6 +154,19 @@ public final class SelectionMenuModule extends XposedModule {
             Map<ResolveInfo, Integer> effectiveClassifications = classifications;
             List<ResolveInfo> filtered = rules.apply(resolved, SelectionMenuModule::componentOf,
                     entry -> effectiveClassifications.getOrDefault(entry, SystemMenuClassifier.UNKNOWN) != SystemMenuClassifier.ORDINARY);
+            // Public query results may share objects with PM caches. Change labels only on
+            // response copies, after classification has used the original ROM labels.
+            if (!rules.aliases.isEmpty()) {
+                for (int index = 0; index < filtered.size(); index++) {
+                    ResolveInfo entry = filtered.get(index);
+                    String alias = rules.aliases.get(componentOf(entry));
+                    if (alias != null) {
+                        ResolveInfo copy = new ResolveInfo(entry);
+                        copy.nonLocalizedLabel = alias;
+                        filtered.set(index, copy);
+                    }
+                }
+            }
             // Keep the original slice and ResolveInfo objects untouched. No internal resolution
             // query is filtered or reordered, including resolveActivity with resolveForStart=false.
             Object effectiveResult = filtered.equals(original) ? result : newSlice.newInstance(filtered);
