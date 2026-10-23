@@ -59,13 +59,14 @@ public final class SelectionMenuModule extends XposedModule {
             ClassLoader classLoader = param.getClassLoader();
             Class<?> packageManager = Class.forName(
                     "com.android.server.pm.IPackageManagerBase", false, classLoader);
-            Method query = packageManager.getDeclaredMethod("queryIntentActivities",
-                    Intent.class, String.class, long.class, int.class);
+            Method query = SystemMenuClassifier.findQueryActivitiesMethod(packageManager);
+            Method queryOptions = SystemMenuClassifier.findQueryActivityOptionsMethod(packageManager);
             Class<?> sliceClass = Class.forName("android.content.pm.ParceledListSlice", false, classLoader);
             Method getList = sliceClass.getMethod("getList");
             Constructor<?> newSlice = sliceClass.getConstructor(List.class);
-            hook(query).intercept(chain -> interceptPublicProcessTextQuery(chain, sliceClass, getList, newSlice));
-            log(android.util.Log.INFO, "SelectionMenuControl", "Hooked public PROCESS_TEXT queryIntentActivities boundary");
+            hook(query).intercept(chain -> interceptPublicProcessTextQuery(chain, sliceClass, getList, newSlice, true));
+            hook(queryOptions).intercept(chain -> interceptPublicProcessTextQuery(chain, sliceClass, getList, newSlice, false));
+            log(android.util.Log.INFO, "SelectionMenuControl", "Hooked public PROCESS_TEXT queryIntentActivities and queryIntentActivityOptions boundaries");
         } catch (Throwable error) {
             ModuleDiagnostics.fault(ModuleDiagnostics.Code.HOOK_LOAD_FAILED);
         }
@@ -80,13 +81,38 @@ public final class SelectionMenuModule extends XposedModule {
         return null;
     }
 
+    private static boolean hasSpecificIntents(List<Object> arguments) {
+        for (Object argument : arguments) {
+            if (argument instanceof Intent[]) {
+                for (Intent specific : (Intent[]) argument) {
+                    if (specific != null) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static int specificPrefixLength(List<ResolveInfo> resolved, boolean hasSpecifics) {
+        if (!hasSpecifics) {
+            return 0;
+        }
+        int count = 0;
+        while (count < resolved.size() && resolved.get(count).specificIndex >= 0) {
+            count++;
+        }
+        return count;
+    }
+
     private static String componentOf(ResolveInfo info) {
         return info.activityInfo == null ? "" : new ComponentName(
                 info.activityInfo.packageName, info.activityInfo.name).flattenToString();
     }
 
     private Object interceptPublicProcessTextQuery(XposedInterface.Chain chain, Class<?> sliceClass,
-                                                   Method getList, Constructor<?> newSlice) throws Throwable {
+                                                   Method getList, Constructor<?> newSlice,
+                                                   boolean allowOriginalQuery) throws Throwable {
         Intent intent = findIntentArgument(chain.getArgs());
         boolean processText = intent != null && Intent.ACTION_PROCESS_TEXT.equals(intent.getAction());
         Object result = chain.proceed();
@@ -95,7 +121,7 @@ public final class SelectionMenuModule extends XposedModule {
         }
         long queryStarted = SystemClock.elapsedRealtime();
         try {
-            boolean originalQuery = isOriginalQuery(intent);
+            boolean originalQuery = allowOriginalQuery && isOriginalQuery(intent);
             SystemRuleStore.Snapshot rules = readRules();
             if (!originalQuery && (!rules.valid || (rules.hiddenComponents.isEmpty()
                     && rules.orderedComponents.isEmpty() && rules.aliases.isEmpty()))) {
@@ -115,27 +141,31 @@ public final class SelectionMenuModule extends XposedModule {
                 }
                 resolved.add((ResolveInfo) entry);
             }
+            int specificCount = specificPrefixLength(resolved, !allowOriginalQuery && hasSpecificIntents(chain.getArgs()));
+            List<ResolveInfo> candidates = specificCount == 0
+                    ? resolved
+                    : new ArrayList<>(resolved.subList(specificCount, resolved.size()));
             Map<ResolveInfo, Integer> classifications = new IdentityHashMap<>();
-            if (originalQuery || !rules.orderedComponents.isEmpty()) {
+            if (originalQuery || (!rules.orderedComponents.isEmpty() && !candidates.isEmpty())) {
                 long identity = Binder.clearCallingIdentity();
                 try {
                     Context context = getSystemContext();
                     SystemMenuClassifier classifier = getMenuClassifier();
                     if (classifier != null) {
                         int userId = (Integer) chain.getArgs().get(chain.getArgs().size() - 1);
-                        SystemMenuClassifier.Result policy = classifier.evaluate(contextForUser(context, userId), resolved, originalQuery, userId);
+                        SystemMenuClassifier.Result policy = classifier.evaluate(contextForUser(context, userId), candidates, originalQuery, userId);
                         classifications = policy.classifications;
                         // Only the module UI receives the system toolbar's display order.
                         // Host queries retain their PM slots before applying ordinary rules.
-                        if (originalQuery) resolved = policy.displayOrder;
+                        if (originalQuery) candidates = policy.displayOrder;
                     }
                 } finally {
                     Binder.restoreCallingIdentity(identity);
                 }
             }
             if (originalQuery) {
-                List<ResolveInfo> annotated = new ArrayList<>(resolved.size());
-                for (ResolveInfo entry : resolved) {
+                List<ResolveInfo> annotated = new ArrayList<>(candidates.size());
+                for (ResolveInfo entry : candidates) {
                     ResolveInfo copy = new ResolveInfo(entry);
                     if (entry.activityInfo != null) {
                         copy.activityInfo = new ActivityInfo(entry.activityInfo);
@@ -152,7 +182,7 @@ public final class SelectionMenuModule extends XposedModule {
                 return annotatedResult;
             }
             Map<ResolveInfo, Integer> effectiveClassifications = classifications;
-            List<ResolveInfo> filtered = rules.apply(resolved, SelectionMenuModule::componentOf,
+            List<ResolveInfo> filtered = rules.apply(candidates, SelectionMenuModule::componentOf,
                     entry -> effectiveClassifications.getOrDefault(entry, SystemMenuClassifier.UNKNOWN) != SystemMenuClassifier.ORDINARY);
             // Public query results may share objects with PM caches. Change labels only on
             // response copies, after classification has used the original ROM labels.
@@ -166,6 +196,12 @@ public final class SelectionMenuModule extends XposedModule {
                         filtered.set(index, copy);
                     }
                 }
+            }
+            if (specificCount > 0) {
+                List<ResolveInfo> combined = new ArrayList<>(specificCount + filtered.size());
+                combined.addAll(resolved.subList(0, specificCount));
+                combined.addAll(filtered);
+                filtered = combined;
             }
             // Keep the original slice and ResolveInfo objects untouched. No internal resolution
             // query is filtered or reordered, including resolveActivity with resolveForStart=false.
