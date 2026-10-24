@@ -80,6 +80,17 @@ final class SystemMenuClassifier {
         return result;
     }
 
+    static Method findQueryActivitiesMethod(Class<?> packageManager) throws NoSuchMethodException {
+        return packageManager.getDeclaredMethod("queryIntentActivities",
+                Intent.class, String.class, long.class, int.class);
+    }
+
+    static Method findQueryActivityOptionsMethod(Class<?> packageManager) throws NoSuchMethodException {
+        return packageManager.getDeclaredMethod("queryIntentActivityOptions",
+                ComponentName.class, Intent[].class, String[].class, Intent.class,
+                String.class, long.class, int.class);
+    }
+
     static final class Result {
         final List<ResolveInfo> displayOrder;
         final Map<ResolveInfo, Integer> classifications;
